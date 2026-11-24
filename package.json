@@ -27,5 +27,11 @@
     "@types/qrcode-terminal": "0.12.2",
     "tsx": "4.20.6",
     "typescript": "5.9.3"
+  },
+  "allowScripts": {
+    "@whiskeysockets/baileys@6.7.24": true,
+    "better-sqlite3@13.2.0": true,
+    "esbuild@0.25.12": true,
+    "protobufjs@7.6.6": true
   }
 }
