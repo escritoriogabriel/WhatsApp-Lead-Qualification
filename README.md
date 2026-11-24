@@ -92,3 +92,11 @@ Para manter o processo após fechar o SSH, use o serviço de exemplo em deploy/w
 - O número e as perguntas ainda precisam ser configurados pelo escritório.
 - A API gratuita não promete limite ou disponibilidade constantes.
 - Nenhum código deste repositório deve ser considerado aconselhamento jurídico automático. O agente faz triagem e encaminha; a análise e a orientação jurídica continuam com a equipe.
+## Instalação
+
+O npm 12 bloqueia por padrão dependências Git. Como o Baileys 6.7.24 fixa `libsignal` no GitHub, use:
+
+    npm install --allow-git=all
+
+Isso habilita dependências Git somente para esse comando, sem alterar a configuração global do npm. Se a instalação no Windows mostrar `EPERM` ao limpar `node_modules` dentro do OneDrive, feche processos Node/terminais que usem o projeto e, se persistir, clone o repositório fora da pasta sincronizada do OneDrive.
+
