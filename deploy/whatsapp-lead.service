@@ -1,0 +1,23 @@
+[Unit]
+Description=WhatsApp Lead Qualification Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=whatsapp-agent
+Group=whatsapp-agent
+WorkingDirectory=/opt/whatsapp-lead-qualification
+EnvironmentFile=/opt/whatsapp-lead-qualification/.env
+ExecStart=/usr/bin/node --enable-source-maps dist/index.js
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/whatsapp-lead-qualification/data
+
+[Install]
+WantedBy=multi-user.target
