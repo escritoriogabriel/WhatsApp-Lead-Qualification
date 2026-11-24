@@ -169,10 +169,10 @@ export async function connectWhatsApp(
       const target = assignment === 'BOT' ? 'Bot - atendimento' : assignment === 'HUMANO' ? 'Atendimento' : 'Novo Lead';
       const ids = await Promise.all(listNames.map((name) => ensureLabel(jid, name)));
       const targetId = ids[listNames.indexOf(target)];
-      for (const id of ids) if (id !== targetId) await socket.removeChatLabel(jid, id).catch(() => undefined);
+      for (const id of ids) if (id !== targetId) await socket.removeChatLabel(jid, id);
       for (const legacyName of ['BOT', 'HUMANO']) {
         const legacyId = getLabelId(legacyName);
-        if (legacyId) await socket.removeChatLabel(jid, legacyId).catch(() => undefined);
+        if (legacyId) await socket.removeChatLabel(jid, legacyId);
       }
       await socket.addChatLabel(jid, targetId!);
     },

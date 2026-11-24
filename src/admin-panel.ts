@@ -160,7 +160,13 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
           }
           const contactAssignment = assignment;
           options.database.ensureContact(jid, 'PAUSADO', 'panel');
-          await options.setContactAssignment(jid, contactAssignment);
+          try {
+            await options.setContactAssignment(jid, contactAssignment);
+          } catch (error) {
+            options.database.setContactAssignment(jid, 'PAUSADO', 'panel-list-sync-failed');
+            options.database.recordDiagnostic(jid, 'falha-lista', error instanceof Error ? error.message : 'Falha ao sincronizar lista do WhatsApp.');
+            throw error;
+          }
           options.database.setContactAssignment(jid, contactAssignment, 'panel');
           options.database.recordDiagnostic(jid, 'atribuicao', `Alterada no painel: ${contactAssignment}`);
           sendJson(response, 200, { ok: true, jid, assignment: contactAssignment });
@@ -191,6 +197,7 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
               results.push({ phone: row.phone, assignment: row.assignment, ok: true });
             } catch (error) {
               const message = error instanceof Error ? error.message : 'Falha ao sincronizar etiqueta.';
+              options.database.setContactAssignment(jid, 'PAUSADO', 'csv-list-sync-failed');
               options.database.recordDiagnostic(jid, 'falha-importacao', message);
               results.push({ phone: row.phone, assignment: row.assignment, ok: false, error: message });
             }
