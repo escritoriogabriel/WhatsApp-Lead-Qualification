@@ -12,10 +12,12 @@
   "audioRetryMessage": "Não consegui compreender esse áudio com segurança. Você pode reenviá-lo ou resumir por escrito?",
   "completionMessage": "Obrigado pelas informações. Vou encaminhar o resumo para a equipe do escritório.",
   "urgencyMessage": "Entendi que pode haver urgência. Vou interromper as perguntas e encaminhar seu relato para a equipe.",
-  "batchWindowMs": 3000,
-  "sendPartDelayMs": 700,
+  "batchWindowSeconds": 3,
+  "sendPartDelaySeconds": 0.7,
+  "audioResponseDelaySeconds": 0,
+  "audioTranscriptionTimeoutSeconds": 60,
   "simulateTyping": true,
-  "typingMsPerCharacter": 25,
+  "typingSecondsPerCharacter": 0.025,
   "maxCharsPerMessage": 500,
   "maxMessagesPerTurn": 2,
   "newContactsOnly": true,
@@ -48,7 +50,8 @@
           "type": "open_text",
           "options": [],
           "structure": "",
-          "required": true
+          "required": true,
+          "contactName": true
         },
         {
           "id": "assunto",

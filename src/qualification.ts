@@ -3,6 +3,7 @@ import type { Logger } from 'pino';
 import type { AssistantConfig, IntakeProfile, RuntimeConfig } from './config.js';
 import {
   AgentDatabase,
+  type ContactAssignment,
   type ConversationState,
   type QueueJob,
   type StoredMessage,
@@ -15,6 +16,11 @@ export interface TextSender {
   (jid: string, text: string): Promise<void>;
 }
 
+export interface ContactManager {
+  setContactAssignment(jid: string, assignment: ContactAssignment): Promise<void>;
+  renameContact(jid: string, name: string): Promise<void>;
+}
+
 export class QualificationWorker {
   constructor(
     private readonly db: AgentDatabase,
@@ -22,6 +28,7 @@ export class QualificationWorker {
     private readonly getAssistant: () => AssistantConfig,
     private readonly runtime: RuntimeConfig,
     private readonly sendText: TextSender,
+    private readonly contacts: ContactManager,
     private readonly logger: Logger,
   ) {}
 
@@ -38,6 +45,7 @@ export class QualificationWorker {
           await delay(this.assistant.workerPollMs, signal);
           continue;
         }
+        this.db.recordDiagnostic(job.jid, 'processando', `Tarefa ${job.id}; tentativa ${job.attempts}`);
         await this.processJob(job);
       } catch (error) {
         if (signal.aborted) break;
@@ -51,6 +59,7 @@ export class QualificationWorker {
     try {
       await this.processConversation(job);
       this.db.completeJob(job.id);
+      this.db.recordDiagnostic(job.jid, 'processada', `Tarefa ${job.id} concluída`);
     } catch (error) {
       const failure = safeError(error);
       const exhausted = this.db.retryJob(
@@ -63,11 +72,13 @@ export class QualificationWorker {
         { jid: job.jid, jobId: job.id, attempts: job.attempts, error: failure },
         exhausted ? 'Conversation job exhausted retries' : 'Conversation job will retry',
       );
+      this.db.recordDiagnostic(job.jid, 'falha', `Tarefa ${job.id}: ${failure}`);
 
       if (exhausted) {
         const state = this.db.getConversationState(job.jid);
         state.paused = true;
         this.db.saveConversationState(job.jid, state);
+        await this.assignContact(job.jid, 'HUMANO', 'processing-failure');
         await this.deliver(
           job,
           job.jid,
@@ -87,14 +98,25 @@ export class QualificationWorker {
     if (incoming.length === 0) return;
 
     const state = this.db.getConversationState(job.jid);
-    if (this.assistant.newContactsOnly && state.profileId === null && !this.db.isFirstContact(job.jid)) {
+    const assignment = this.db.getContactAssignment(job.jid);
+    if (assignment !== 'BOT') {
       await this.removeTemporaryMedia(incoming);
       this.db.markMessagesProcessed(incoming.map((message) => message.id));
+      this.db.recordDiagnostic(job.jid, 'ignorada', `Sem etiqueta BOT (atribuição: ${assignment ?? 'desconhecida'})`);
+      this.logger.info({ jid: job.jid, assignment }, 'Mensagem ignorada: contato sem etiqueta BOT');
+      return;
+    }
+    if (this.assistant.newContactsOnly && state.profileId === null && !this.db.isFirstContact(job.jid) && !this.db.hasExplicitBotAssignment(job.jid)) {
+      await this.removeTemporaryMedia(incoming);
+      this.db.markMessagesProcessed(incoming.map((message) => message.id));
+      this.db.recordDiagnostic(job.jid, 'ignorada', 'Regra de somente novos contatos; atribua BOT explicitamente para reativar');
       return;
     }
     if (state.paused) {
       await this.removeTemporaryMedia(incoming);
       this.db.markMessagesProcessed(incoming.map((message) => message.id));
+      this.db.recordDiagnostic(job.jid, 'ignorada', 'Conversa pausada; reaplique a etiqueta BOT para reativar');
+      this.logger.info({ jid: job.jid }, 'Mensagem ignorada: conversa pausada');
       return;
     }
 
@@ -106,9 +128,13 @@ export class QualificationWorker {
         continue;
       }
       try {
+        if (this.assistant.audioResponseDelaySeconds > 0) {
+          await delaySeconds(this.assistant.audioResponseDelaySeconds);
+        }
         const transcript = await this.provider.transcribe(
           message.mediaPath,
           this.assistant.maxAudioBytes,
+          this.assistant.audioTranscriptionTimeoutSeconds,
         );
         this.db.saveTranscript(message.id, transcript);
       } catch (error) {
@@ -158,6 +184,7 @@ export class QualificationWorker {
       );
       state.paused = true;
       this.db.saveConversationState(job.jid, state);
+      await this.assignContact(job.jid, 'HUMANO', 'urgency');
       await this.notifyHuman(job, job.jid, state, 'Palavra de urgência detectada');
       this.db.markMessagesProcessed(incoming.map((message) => message.id));
       return;
@@ -175,7 +202,24 @@ export class QualificationWorker {
       state.fields,
       this.assistant,
     );
+    if (this.db.getContactAssignment(job.jid) !== 'BOT') {
+      await this.removeTemporaryMedia(incoming);
+      this.db.markMessagesProcessed(incoming.map((message) => message.id));
+      this.db.recordDiagnostic(job.jid, 'ignorada', 'A atribuição mudou durante o processamento');
+      return;
+    }
     state.fields = { ...state.fields, ...extraction.capturedFields };
+    const nameField = profile.fields.find((field) => field.contactName);
+    const capturedName = nameField && state.pendingFieldId === nameField.id
+      ? extraction.capturedFields[nameField.id]
+      : undefined;
+    if (capturedName) {
+      const cleanedName = capturedName.trim().replace(/\s+/g, ' ').slice(0, 120);
+      if (cleanedName) {
+        this.db.setContactName(job.jid, cleanedName);
+        await this.contacts.renameContact(job.jid, cleanedName);
+      }
+    }
 
     let nextField = profile.fields.find(
       (field) =>
@@ -207,6 +251,7 @@ export class QualificationWorker {
       state.completed = true;
       state.paused = true;
       this.db.saveConversationState(job.jid, state);
+      await this.assignContact(job.jid, 'HUMANO', 'completion');
       await this.deliver(
         job,
         job.jid,
@@ -266,6 +311,7 @@ export class QualificationWorker {
   ): Promise<void> {
     state.paused = true;
     this.db.saveConversationState(jid, state);
+    await this.assignContact(jid, 'HUMANO', 'handoff');
     await this.deliver(job, jid, [this.assistant.handoffMessage], 'handoff-client');
     await this.notifyHuman(job, jid, state, reason, history);
   }
@@ -316,6 +362,17 @@ export class QualificationWorker {
     );
   }
 
+  private async assignContact(jid: string, assignment: ContactAssignment, source: string): Promise<void> {
+    try {
+      await this.contacts.setContactAssignment(jid, assignment);
+    } catch (error) {
+      const message = safeError(error);
+      this.logger.warn({ jid, assignment, error: message }, 'Atribuição local aplicada; falha ao sincronizar etiqueta WhatsApp');
+      this.db.recordDiagnostic(jid, 'falha-etiqueta', message);
+    }
+    this.db.setContactAssignment(jid, assignment, source);
+  }
+
   private missingFields(state: ConversationState): string[] {
     const profile = this.assistant.profiles.find(
       (item) => item.id === state.profileId,
@@ -353,8 +410,12 @@ export class QualificationWorker {
       ? messages
       : [...messages.slice(0, maxMessages - 1), messages.slice(maxMessages - 1).join('\n\n')];
     for (let index = 0; index < selected.length; index += 1) {
-      if (index > 0 && this.assistant.sendPartDelayMs > 0) {
-        await delay(this.assistant.sendPartDelayMs);
+      if (suffix.startsWith('qualification-') && this.db.getContactAssignment(jid) !== 'BOT') {
+        this.db.recordDiagnostic(jid, 'ignorada', 'A atribuição mudou antes do envio');
+        return;
+      }
+      if (index > 0 && this.assistant.sendPartDelaySeconds > 0) {
+        await delaySeconds(this.assistant.sendPartDelaySeconds);
       }
       const id = this.db.queueOutbound(
         job.id + ':' + suffix + ':' + index,
@@ -364,6 +425,7 @@ export class QualificationWorker {
       if (this.db.isOutboundSent(id)) continue;
       await this.sendText(jid, selected[index]!);
       this.db.markOutboundSent(id);
+      this.db.recordDiagnostic(jid, 'respondida', `Mensagem ${index + 1}/${selected.length}`);
     }
   }
 
@@ -411,4 +473,14 @@ function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
       { once: true },
     );
   });
+}
+
+async function delaySeconds(seconds: number): Promise<void> {
+  let remaining = seconds * 1000;
+  const largestSafeTimer = 2_147_000_000;
+  while (remaining > 0) {
+    const step = Math.min(remaining, largestSafeTimer);
+    await delay(step);
+    remaining -= step;
+  }
 }

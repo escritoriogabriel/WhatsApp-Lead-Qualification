@@ -2,7 +2,7 @@ const byId = (id) => document.getElementById(id);
 const app = byId('app');
 const login = byId('login');
 const content = byId('content');
-const TITLES = { overview:'Visão geral', behavior:'Comportamento', flow:'Fluxos e perguntas', messages:'Mensagens', knowledge:'Instruções e materiais', preview:'Testar conversa' };
+const TITLES = { overview:'Visão geral', behavior:'Comportamento', flow:'Fluxos e perguntas', messages:'Mensagens', knowledge:'Instruções e materiais', preview:'Testar conversa', contacts:'Contatos e etiquetas', diagnostics:'Fila e diagnósticos' };
 let config = null;
 let page = 'overview';
 let profileIndex = 0;
@@ -11,7 +11,7 @@ let dirty = false;
 async function api(path, options = {}) {
   const response = await fetch(path, { credentials:'same-origin', ...options, headers:{ ...(options.body ? {'Content-Type':'application/json'} : {}), ...(options.headers || {}) } });
   const payload = response.status === 204 ? {} : await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(payload.error || `Falha na solicitação (${response.status}).`);
+  if (!response.ok) { const error = new Error(payload.error || `Falha na solicitação (${response.status}).`); error.details=payload.details||[]; throw error; }
   return payload;
 }
 
@@ -24,7 +24,7 @@ function input(label, path, value, opts = {}) {
   const attrs = opts.attrs || '';
   return `<div class="control${cls}"><label>${escapeHtml(label)}</label><input data-path="${path}" ${attrs} value="${escapeHtml(value)}" />${help}</div>`;
 }
-function numberInput(label, path, value, min, max, help='') { return input(label,path,value,{attrs:`type="number" min="${min}" max="${max}"`,help}); }
+function numberInput(label, path, value, min=null, max=null, help='',step='1') { const bounds=`${min!==null?` min="${min}"`:''}${max!==null?` max="${max}"`:''}`; return input(label,path,value,{attrs:`type="number" step="${step}"${bounds}`,help}); }
 function textarea(label,path,value,help='',rows=4) { return `<div class="control full-width"><label>${escapeHtml(label)}</label><textarea data-path="${path}" rows="${rows}">${escapeHtml(value)}</textarea>${help?`<small>${escapeHtml(help)}</small>`:''}</div>`; }
 function select(label,path,value,options,help='') { return `<div class="control"><label>${escapeHtml(label)}</label><select data-path="${path}">${options.map(([v,l])=>`<option value="${escapeHtml(v)}" ${v===value?'selected':''}>${escapeHtml(l)}</option>`).join('')}</select>${help?`<small>${escapeHtml(help)}</small>`:''}</div>`; }
 function toggle(label,path,checked,help='') { return `<div class="toggle-row"><div class="toggle-copy"><strong>${escapeHtml(label)}</strong><small>${escapeHtml(help)}</small></div><label class="switch"><input type="checkbox" data-path="${path}" ${checked?'checked':''}><span></span></label></div>`; }
@@ -41,11 +41,14 @@ function render() {
   if(page==='messages') renderMessages();
   if(page==='knowledge') renderKnowledge();
   if(page==='preview') renderPreview();
+  if(page==='contacts') void renderContacts();
+  if(page==='diagnostics') void renderDiagnostics();
   content.querySelectorAll('[data-path]').forEach((el)=>{
     const eventName=['checkbox','number','select-one','radio'].includes(el.type)?'change':'input';
     el.addEventListener(eventName,()=>{
       const value=el.type==='checkbox'?el.checked:el.type==='number'?Number(el.value):el.value;
       setPath(el.dataset.path,value);
+      if(!byId('validation-errors').classList.contains('hidden')) validateBeforeSave(false);
       if(el.dataset.path.endsWith('.type')) renderFlow();
       if(el.dataset.path==='areaFieldId') renderMessages();
       if(page==='preview') renderPreview();
@@ -53,6 +56,7 @@ function render() {
   });
   content.querySelectorAll('[data-list-path]').forEach((el)=>el.addEventListener('input',()=>{setPath(el.dataset.listPath,parseList(el.value));}));
   content.querySelectorAll('[data-action]').forEach((el)=>el.addEventListener('click',()=>action(el.dataset.action,el.dataset.index)));
+  content.querySelectorAll('[data-contact-assignment]').forEach((el)=>el.addEventListener('change',()=>updateContact(el.dataset.jid,el.value)));
 }
 
 function renderOverview() {
@@ -64,8 +68,8 @@ function renderOverview() {
 
 function renderBehavior() {
   content.innerHTML=heading('COMPORTAMENTO','Defina o ritmo e os limites.','Ajuste a espera, a simulação de digitação, o tamanho das mensagens e a quem o agente responde.')+
-    `<div class="grid two"><div class="card"><h2>Quem recebe resposta</h2><p class="card-description">Controle quando uma conversa pode começar automaticamente.</p>${toggle('Responder apenas novos contatos','newContactsOnly',config.newContactsOnly,'“Novo” significa que este agente ainda não registrou mensagens daquele número. O WhatsApp não informa por Baileys se o número já era conhecido antes da instalação.')}</div><div class="card"><h2>Simulação humana</h2><p class="card-description">Ajuste a presença e a pausa entre respostas.</p>${toggle('Mostrar “escrevendo…”','simulateTyping',config.simulateTyping,'Durante a espera, o contato verá a presença de digitação do WhatsApp.')}${numberInput('Velocidade simulada (ms por caractere)','typingMsPerCharacter',config.typingMsPerCharacter,0,100,'A espera é limitada a 12 segundos por balão.')}</div></div>`+
-    `<div class="card section-card"><h2>Cadência e tamanho</h2><p class="card-description">A janela de agrupamento permite que o agente espere mensagens enviadas em sequência antes de responder.</p><div class="field-grid">${numberInput('Esperar para agrupar mensagens (ms)','batchWindowMs',config.batchWindowMs,0,60000)}${numberInput('Pausa entre balões (ms)','sendPartDelayMs',config.sendPartDelayMs,0,10000)}${numberInput('Máximo de balões por resposta','maxMessagesPerTurn',config.maxMessagesPerTurn,1,4)}${numberInput('Caracteres máximos na confirmação','maxCharsPerMessage',config.maxCharsPerMessage,80,4000,'Limita a frase de confirmação criada pelo modelo; perguntas configuradas são mantidas como escritas.')}${numberInput('Tentativas antes de pular uma pergunta','maxFieldAttempts',config.maxFieldAttempts,1,5,'Se a resposta não for compreendida após essas tentativas, a triagem segue e sinaliza o campo à equipe.')}${textarea('Palavras ou expressões de urgência (uma por linha)','handoffKeywords',newlineList(config.handoffKeywords),'Ao encontrar uma delas, o agente interrompe as perguntas e encaminha o atendimento.',4)}${input('Comando para pedir uma pessoa','humanCommand',config.humanCommand,{help:'O contato pode enviar este comando para pausar a automação e solicitar atendimento humano.'})}</div><div class="notice">O modo “somente novos contatos” usa o histórico que o agente passa a registrar. Contatos antigos que nunca escreveram ao número depois da instalação podem parecer novos ao agente.</div></div>`;
+    `<div class="grid two"><div class="card"><h2>Quem recebe resposta</h2><p class="card-description">Contatos marcados com BOT podem ser atendidos. HUMANO sempre pausa a automação.</p>${toggle('Responder apenas novos contatos','newContactsOnly',config.newContactsOnly,'Uma atribuição BOT no painel ou na etiqueta permite reativar um contato conhecido.')}</div><div class="card"><h2>Simulação humana</h2><p class="card-description">Ajuste a presença e o tempo de digitação.</p>${toggle('Mostrar “escrevendo…”','simulateTyping',config.simulateTyping,'Durante a espera, o contato verá a presença de digitação do WhatsApp.')}${numberInput('Tempo de digitação por caractere (segundos)','typingSecondsPerCharacter',config.typingSecondsPerCharacter,0,null,'O tempo acompanha o tamanho do balão; não há teto máximo.','any')}</div></div>`+
+    `<div class="card section-card"><h2>Cadência e tamanho</h2><p class="card-description">Defina as esperas em segundos. Durações longas são aguardadas em etapas seguras.</p><div class="field-grid">${numberInput('Aguardar para agrupar mensagens (segundos)','batchWindowSeconds',config.batchWindowSeconds,0,null,'Espera mensagens enviadas em sequência antes de responder.','any')}${numberInput('Intervalo entre balões do bot (segundos)','sendPartDelaySeconds',config.sendPartDelaySeconds,0,null,'Pausa entre uma mensagem do bot e a seguinte.','any')}${numberInput('Esperar antes de processar áudio (segundos)','audioResponseDelaySeconds',config.audioResponseDelaySeconds,0,null,'Tempo de espera após receber o áudio e antes de iniciar a transcrição.','any')}${numberInput('Prazo para transcrever áudio (segundos)','audioTranscriptionTimeoutSeconds',config.audioTranscriptionTimeoutSeconds,0.001,null,'Se a transcrição exceder este prazo, o sistema informa que não compreendeu o áudio.','any')}${numberInput('Máximo de balões por resposta','maxMessagesPerTurn',config.maxMessagesPerTurn,1,4)}${numberInput('Caracteres máximos na confirmação','maxCharsPerMessage',config.maxCharsPerMessage,80,4000,'Limita a frase de confirmação criada pelo modelo; perguntas configuradas são mantidas como escritas.')}${numberInput('Tentativas antes de pular uma pergunta','maxFieldAttempts',config.maxFieldAttempts,1,5,'Se a resposta não for compreendida após essas tentativas, a triagem segue e sinaliza o campo à equipe.')}${textarea('Palavras ou expressões de urgência (uma por linha)','handoffKeywords',newlineList(config.handoffKeywords),'Ao encontrar uma delas, o agente interrompe as perguntas e encaminha o atendimento.',4)}${input('Comando para pedir uma pessoa','humanCommand',config.humanCommand,{help:'O contato pode enviar este comando para pausar a automação e solicitar atendimento humano.'})}</div></div>`;
   const urgent = content.querySelector('[data-path="handoffKeywords"]'); if(urgent){urgent.dataset.listPath='handoffKeywords';urgent.removeAttribute('data-path');}
 }
 
@@ -91,7 +95,7 @@ function questionCard(field,index,profile) {
   const conditionOptions=[['','Sempre perguntar'],...profile.fields.filter((other)=>other.id!==field.id).map((other)=>[other.id,`Quando “${other.label}”`])];
   const condition=select('Condição',base+'.askWhen.fieldId',field.askWhen?.fieldId||'',conditionOptions,'Se não corresponder ao valor definido, a pergunta será ignorada.');
   const conditionValue=input('Valor para a condição',base+'.askWhen.value',field.askWhen?.value||'');
-  return `<div class="question-card"><div class="question-head"><span class="question-number">${String(index+1).padStart(2,'0')}</span><strong>${escapeHtml(field.label||'Nova pergunta')}</strong><button class="button small" data-action="up-field" data-index="${index}" ${index===0?'disabled':''}>↑</button><button class="button small" data-action="down-field" data-index="${index}" ${index===profile.fields.length-1?'disabled':''}>↓</button><button class="button small danger" data-action="remove-field" data-index="${index}">Remover</button></div><div class="field-grid">${input('Identificador único',base+'.id',field.id)}${input('Nome do campo',base+'.label',field.label)}${textarea('Pergunta enviada ao contato',base+'.question',field.question,'A pergunta exibida quando este campo for o próximo.',2)}${select('Tipo de resposta',base+'.type',field.type,typeOptions)}${textarea('Estrutura ou orientação para interpretar a resposta',base+'.structure',field.structure||'','Ex.: peça data aproximada e cidade; aceite que a pessoa não saiba.',2)}${choices}${condition}${conditionValue}<div class="control"><label>Obrigatoriedade</label><label class="checkboxline"><input type="checkbox" data-path="${base}.required" ${field.required?'checked':''}> Campo necessário para concluir a triagem</label></div></div></div>`;
+  return `<div class="question-card"><div class="question-head"><span class="question-number">${String(index+1).padStart(2,'0')}</span><strong>${escapeHtml(field.label||'Nova pergunta')}</strong><button class="button small" data-action="up-field" data-index="${index}" ${index===0?'disabled':''}>↑</button><button class="button small" data-action="down-field" data-index="${index}" ${index===profile.fields.length-1?'disabled':''}>↓</button><button class="button small danger" data-action="remove-field" data-index="${index}">Remover</button></div><div class="field-grid">${input('Identificador único',base+'.id',field.id)}${input('Nome do campo',base+'.label',field.label)}${textarea('Pergunta enviada ao contato',base+'.question',field.question,'A pergunta exibida quando este campo for o próximo.',2)}${select('Tipo de resposta',base+'.type',field.type,typeOptions)}${textarea('Estrutura ou orientação para interpretar a resposta',base+'.structure',field.structure||'','Ex.: peça data aproximada e cidade; aceite que a pessoa não saiba.',2)}${choices}${condition}${conditionValue}<div class="control"><label>Obrigatoriedade</label><label class="checkboxline"><input type="checkbox" data-path="${base}.required" ${field.required?'checked':''}> Campo necessário para concluir a triagem</label><label class="checkboxline"><input type="checkbox" data-path="${base}.contactName" ${field.contactName?'checked':''}> Usar resposta para renomear o contato</label></div></div></div>`;
 }
 
 function renderMessages() {
@@ -121,10 +125,120 @@ function renderPreview() {
   byId('preview-area').addEventListener('change',renderPreview);
 }
 
+async function renderContacts() {
+  content.innerHTML=heading('OPERAÇÃO','Controle quem o agente atende.','A etiqueta BOT autoriza o atendimento automático. HUMANO sempre pausa o agente; sem etiqueta conhecida, a conversa fica pausada.')+
+    `<div class="grid two"><section class="card"><h2>Atribuir contato</h2><p class="card-description">Informe o número com DDI. A etiqueta será sincronizada com o WhatsApp conectado.</p><form id="contact-form" class="field-grid"><div class="control"><label>Telefone com DDI</label><input id="contact-phone" type="tel" placeholder="+55 11 99999-9999" required></div><div class="control"><label>Atribuição</label><select id="contact-assignment"><option value="BOT">Bot atende</option><option value="HUMANO">Equipe humana</option><option value="PAUSADO">Pausado</option></select></div><button class="button primary" type="submit">Aplicar atribuição</button></form></section><section class="card"><h2>Importar lista CSV</h2><p class="card-description">Colunas aceitas: telefone, atribuicao e nome. Atribuição: BOT ou HUMANO. Até 1.000 contatos.</p><div class="control"><label for="contact-file">Escolha o arquivo CSV (ou cole os dados abaixo)</label><input id="contact-file" type="file" accept=".csv,text/csv"></div><textarea id="contact-csv" rows="5" placeholder="telefone,atribuicao,nome&#10;+5511999999999,BOT,Ana Silva"></textarea><button class="button section-card" data-action="import-contacts">Importar contatos</button><div id="import-result"></div></section></div>`+
+    `<section class="card section-card"><div class="card-title-row"><div><h2>Contatos acompanhados</h2><p class="card-description" style="margin:5px 0 0">Alterar a atribuição também atualiza as etiquetas no WhatsApp.</p></div><button class="button small" data-action="refresh-contacts">Atualizar</button></div><div id="contacts-table" class="table-wrap"><div class="empty-state">Carregando contatos...</div></div></section>`;
+  const form=byId('contact-form');
+  form?.addEventListener('submit',async(event)=>{event.preventDefault();const phone=byId('contact-phone').value;const assignment=byId('contact-assignment').value;try{await api('/api/contacts/assignment',{method:'PUT',body:JSON.stringify({phone,assignment})});toast('Atribuição atualizada.');void renderContacts();}catch(error){toast(error.message,true);}});
+  byId('contact-file')?.addEventListener('change',async(event)=>{const file=event.target.files?.[0];if(file)byId('contact-csv').value=await file.text();});
+  try {
+    const contacts=await api('/api/contacts');
+    const table=byId('contacts-table');
+    table.innerHTML=contacts.length?`<table><thead><tr><th>Contato</th><th>Número</th><th>Atendimento</th><th>Última atividade</th></tr></thead><tbody>${contacts.map((contact)=>`<tr><td><strong>${escapeHtml(contact.displayName||'Contato')}</strong><small>${escapeHtml(contact.source)}</small></td><td>${escapeHtml(contact.phone)}</td><td><select data-contact-assignment data-jid="${escapeHtml(contact.jid)}"><option value="BOT" ${contact.assignment==='BOT'?'selected':''}>BOT</option><option value="HUMANO" ${contact.assignment==='HUMANO'?'selected':''}>HUMANO</option><option value="PAUSADO" ${contact.assignment==='PAUSADO'?'selected':''}>Pausado</option></select></td><td>${contact.lastActivityAt?new Date(contact.lastActivityAt).toLocaleString('pt-BR'):'—'}</td></tr>`).join('')}</tbody></table>`:'<div class="empty-state">Ainda não há contatos registrados.</div>';
+    table.querySelectorAll('[data-contact-assignment]').forEach((el)=>el.addEventListener('change',()=>updateContact(el.dataset.jid,el.value)));
+  } catch(error) { byId('contacts-table').innerHTML=`<div class="notice">Não foi possível carregar contatos: ${escapeHtml(error.message)}</div>`; }
+}
+
+async function renderDiagnostics() {
+  content.innerHTML=heading('OPERAÇÃO','Entenda o que ocorreu com cada mensagem.','Acompanhe recebimento, fila, processamento, resposta, pausas e falhas com o motivo registrado.')+
+    `<section class="card"><div class="card-title-row"><div><h2>Eventos recentes</h2><p class="card-description" style="margin:5px 0 0">Mensagens ignoradas mostram o motivo; falhas mostram o erro para orientar a correção.</p></div><button class="button small" data-action="refresh-diagnostics">Atualizar</button></div><div id="diagnostics-list" class="timeline"><div class="empty-state">Carregando eventos...</div></div></section>`;
+  try {
+    const events=await api('/api/diagnostics');
+    const list=byId('diagnostics-list');
+    list.innerHTML=events.length?events.map((event)=>`<article class="timeline-item"><span class="timeline-dot ${event.event.includes('falha')?'bad':event.event==='respondida'?'good':''}"></span><div class="timeline-copy"><strong>${escapeHtml(event.event.replaceAll('-',' '))}</strong><span>${escapeHtml(event.detail||'—')}</span><small>${escapeHtml(event.jid)} · ${new Date(event.createdAt).toLocaleString('pt-BR')}</small></div></article>`).join(''):'<div class="empty-state">Nenhum evento registrado ainda.</div>';
+  } catch(error) { byId('diagnostics-list').innerHTML=`<div class="notice">Não foi possível carregar eventos: ${escapeHtml(error.message)}</div>`; }
+}
+
+async function updateContact(jid,assignment) {
+  try { await api('/api/contacts/assignment',{method:'PUT',body:JSON.stringify({jid,assignment})});toast(`Contato atribuído a ${assignment}.`); }
+  catch(error){toast(`A atribuição não foi sincronizada: ${error.message}`,true);void renderContacts();}
+}
+
+async function importContacts() {
+  const csv=byId('contact-csv').value;
+  try {
+    const result=await api('/api/contacts/import',{method:'POST',body:JSON.stringify({csv})});
+    const failed=result.results.filter((row)=>!row.ok);
+    byId('import-result').innerHTML=failed.length?`<div class="error-summary import-errors"><strong>Falhas na importação</strong><ul>${failed.map((row)=>`<li><b>${escapeHtml(row.phone)}</b>: ${escapeHtml(row.error)}</li>`).join('')}</ul></div>`:'<div class="notice green">Todos os contatos foram importados e sincronizados.</div>';
+    toast(`${result.imported} contato(s) importado(s).${failed.length?` ${failed.length} com erro; confira os diagnósticos.`:''}`,failed.length>0);
+    void renderContacts();
+  } catch(error){toast(error.message,true);}
+}
+
+function validateBeforeSave(show=true) {
+  const issues=[];
+  const requiredStrings=['officeName','assistantName','writingStyle','greeting','areaQuestion','handoffMessage','audioRetryMessage','completionMessage','urgencyMessage','humanCommand','defaultProfileId','areaFieldId'];
+  for(const path of requiredStrings){const value=path.split('.').reduce((target,key)=>target?.[key],config);if(typeof value!=='string'||!value.trim())issues.push({path,message:'Campo obrigatório vazio.',fix:'Preencha este campo antes de salvar.'});}
+  if(!Array.isArray(config.profiles)||config.profiles.length===0)issues.push({path:'profiles',message:'Crie ao menos um fluxo.',fix:'Adicione uma área de atendimento.'});
+  (config.profiles||[]).forEach((profile,profileIndex)=>{
+    for(const key of ['id','label'])if(!String(profile[key]||'').trim())issues.push({path:`profiles.${profileIndex}.${key}`,message:'Campo obrigatório vazio.',fix:'Preencha este campo.'});
+    if(!profile.fields?.length)issues.push({path:`profiles.${profileIndex}.fields`,message:'O fluxo precisa de uma pergunta.',fix:'Adicione ao menos uma pergunta.'});
+    (profile.fields||[]).forEach((field,fieldIndex)=>{
+      for(const key of ['id','label','question'])if(!String(field[key]||'').trim())issues.push({path:`profiles.${profileIndex}.fields.${fieldIndex}.${key}`,message:'Campo obrigatório vazio.',fix:'Preencha este campo.'});
+      if(['single_choice','multiple_choice'].includes(field.type)&&!field.options?.length)issues.push({path:`profiles.${profileIndex}.fields.${fieldIndex}.options`,message:'Faltam opções de resposta.',fix:'Adicione pelo menos uma opção.'});
+    });
+    if(profile.fields?.length&&!profile.fields.some((field)=>field.id===config.areaFieldId&&field.required))issues.push({path:'areaFieldId',message:`O fluxo “${profile.label}” não possui o campo de área obrigatório.`,fix:'Inclua esse campo ou selecione uma área que exista em todos os fluxos.'});
+  });
+  (config.materials||[]).forEach((material,index)=>{
+    for(const key of ['title','content'])if(!String(material[key]||'').trim())issues.push({path:`materials.${index}.${key}`,message:'Material incompleto.',fix:'Preencha o título e o conteúdo ou remova este material.'});
+  });
+  const numericRules={maxCharsPerMessage:[80,4000],maxMessagesPerTurn:[1,4],maxFieldAttempts:[1,5],maxAudioBytes:[1024,25000000],maxHistoryMessages:[1,50],workerPollMs:[100,10000]};
+  for(const [key,[minimum,maximum]] of Object.entries(numericRules)){const value=config[key];if(!Number.isFinite(value)||value<minimum||value>maximum)issues.push({path:key,message:'Valor numérico fora do intervalo permitido.',fix:`Informe um valor entre ${minimum} e ${maximum}.`});}
+  for(const key of ['batchWindowSeconds','sendPartDelaySeconds','audioResponseDelaySeconds','audioTranscriptionTimeoutSeconds','typingSecondsPerCharacter']){const value=config[key];if(!Number.isFinite(value)||value<(key==='audioTranscriptionTimeoutSeconds'?0.001:0)||value*1000>Number.MAX_SAFE_INTEGER)issues.push({path:key,message:'Duração inválida ou grande demais para medir.',fix:'Informe uma duração positiva em segundos que o sistema consiga representar.'});}
+  document.querySelectorAll('.control.invalid').forEach((node)=>node.classList.remove('invalid'));
+  const panel=byId('validation-errors');
+  if(issues.length&&show){
+    for(const issue of issues)markInvalid(issue.path);
+    panel.classList.remove('hidden');
+    panel.innerHTML=`<strong>Há informações para corrigir antes de salvar (${issues.length}).</strong><ul>${issues.slice(0,12).map((issue)=>`<li><button type="button" class="error-link" data-error-path="${escapeHtml(issue.path)}">${escapeHtml(describePath(issue.path)||'Configuração')}</button>: ${escapeHtml(issue.message)} ${escapeHtml(issue.fix)}</li>`).join('')}</ul>`;
+    attachErrorLinks(panel);
+  } else if(!issues.length){panel.classList.add('hidden');panel.innerHTML='';}
+  return issues;
+}
+
+function markInvalid(path) {
+  const escaped=CSS.escape(path);
+  const field=content.querySelector(`[data-path="${escaped}"]`)||content.querySelector(`[data-list-path="${escaped}"]`);
+  field?.closest('.control')?.classList.add('invalid');
+}
+
+function attachErrorLinks(panel) {
+  panel.querySelectorAll('[data-error-path]').forEach((button)=>button.addEventListener('click',()=>{
+    const path=button.dataset.errorPath||'';
+    const parts=path.split('.');
+    if(parts[0]==='profiles'){page='flow';profileIndex=Number(parts[1])||0;}
+    else if(['materials','writingStyle','officeMemory','forbiddenTopics'].includes(parts[0]))page='knowledge';
+    else if(['officeName','assistantName','greeting','areaQuestion','areaFieldId','handoffMessage','audioRetryMessage','completionMessage','urgencyMessage'].includes(parts[0]))page='messages';
+    else page='behavior';
+    render();
+    markInvalid(path);
+    const field=content.querySelector(`[data-path="${CSS.escape(path)}"]`)||content.querySelector(`[data-list-path="${CSS.escape(path)}"]`);
+    field?.scrollIntoView({behavior:'smooth',block:'center'});
+  }));
+}
+
+function describePath(path) {
+  const parts=(path||'').split('.');
+  let label='Configuração';
+  if(parts[0]==='profiles'&&Number.isInteger(Number(parts[1]))){
+    const profile=config.profiles[Number(parts[1])];
+    label=`Fluxos e perguntas → ${profile?.label||`Fluxo ${Number(parts[1])+1}`}`;
+    if(parts[2]==='fields'&&Number.isInteger(Number(parts[3]))){const field=profile?.fields?.[Number(parts[3])];label+=` → ${field?.label||`Pergunta ${Number(parts[3])+1}`}`;parts.splice(0,4);}
+    else parts.splice(0,2);
+  }
+  const titles={officeName:'Nome do escritório',assistantName:'Nome do assistente',writingStyle:'Estilo de escrita',greeting:'Mensagem de saudação',areaQuestion:'Pergunta sobre a área',areaFieldId:'Campo da área',handoffMessage:'Mensagem de encaminhamento',audioRetryMessage:'Resposta para áudio',completionMessage:'Mensagem de conclusão',urgencyMessage:'Mensagem de urgência',humanCommand:'Comando para atendimento humano',id:'Identificador',label:'Nome do campo',question:'Pergunta enviada',options:'Opções de resposta',materials:'Materiais de apoio',fields:'Perguntas do fluxo',askWhen:'Condição da pergunta',fieldId:'Pergunta da condição',title:'Título do material',content:'Conteúdo do material',defaultProfileId:'Área padrão'};
+  const last=parts.at(-1)||'';
+  return `${label}${label!=='Configuração'?' → ':''}${titles[last]||last.replaceAll(/[A-Z]/g,(letter)=>` ${letter.toLowerCase()}`)}`;
+}
+
 function action(name,indexValue) {
   const index=Number(indexValue);
   const profile=config.profiles[profileIndex];
   if(name==='goto-behavior'){page='behavior';render();return;}
+  if(name==='import-contacts'){void importContacts();return;}
+  if(name==='refresh-contacts'){void renderContacts();return;}
+  if(name==='refresh-diagnostics'){void renderDiagnostics();return;}
   if(name==='add-profile') {const id=`fluxo-${Date.now().toString(36)}`;config.profiles.push({id,label:'Nova área',triggers:[],fields:[{id:config.areaFieldId,label:'Área ou assunto',question:'Em poucas palavras, qual é a área ou o assunto?',type:'open_text',options:[],structure:'',required:true}]});profileIndex=config.profiles.length-1;markDirty();renderFlow();return;}
   if(name==='remove-profile'){if(config.profiles.length<2){toast('Mantenha ao menos uma área de atendimento.');return;}config.profiles.splice(profileIndex,1);profileIndex=0;if(!config.profiles.some((item)=>item.id===config.defaultProfileId))config.defaultProfileId=config.profiles[0].id;markDirty();renderFlow();return;}
   if(name==='add-field'){profile.fields.push({id:`campo-${Date.now().toString(36)}`,label:'Nova pergunta',question:'',type:'open_text',options:[],structure:'',required:true});markDirty();renderFlow();return;}
@@ -136,11 +250,20 @@ function action(name,indexValue) {
 }
 
 async function save() {
+  if(validateBeforeSave().length)return;
   try {
     const normalized={...config,profiles:config.profiles.map((profile)=>({...profile,fields:profile.fields.map((field)=>{const copy={...field};if(!copy.askWhen?.fieldId||!copy.askWhen?.value)delete copy.askWhen;return copy;})}))};
     const result=await api('/api/config',{method:'PUT',body:JSON.stringify(normalized)});
-    dirty=false;byId('save-state').textContent=`Salvo às ${new Date(result.savedAt).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})}`;toast('Configurações salvas e aplicadas.');
-  } catch(error){toast(error.message,true);}
+    dirty=false;byId('save-state').textContent=`Salvo às ${new Date(result.savedAt).toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'})}`;byId('validation-errors').classList.add('hidden');toast('Configurações salvas e aplicadas.');
+  } catch(error){
+    if(error.details?.length){
+      for(const issue of error.details)markInvalid(issue.path);
+      byId('validation-errors').classList.remove('hidden');
+      byId('validation-errors').innerHTML=`<strong>O servidor encontrou informações para corrigir.</strong><ul>${error.details.map((issue)=>`<li><button type="button" class="error-link" data-error-path="${escapeHtml(issue.path)}">${escapeHtml(describePath(issue.path))}</button>: ${escapeHtml(issue.message)} ${escapeHtml(issue.fix||'Revise este campo.')}</li>`).join('')}</ul>`;
+      attachErrorLinks(byId('validation-errors'));
+    } else {byId('validation-errors').classList.remove('hidden');byId('validation-errors').textContent=error.message;}
+    toast('Veja a caixa de erro no início da página para localizar o problema.',true);
+  }
 }
 function toast(message,isError=false){const el=byId('toast');el.textContent=message;el.style.background=isError?'#923f38':'#24332c';el.classList.add('show');setTimeout(()=>el.classList.remove('show'),3500);}
 async function openApp(){config=await api('/api/config');login.classList.add('hidden');app.classList.remove('hidden');render();}

@@ -3,7 +3,9 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, writeFile, unlink } from 'node:fs/promises';
 import { dirname, extname, join, resolve } from 'node:path';
 import type { Logger } from 'pino';
-import { validateAssistantConfig, type AssistantConfig } from './config.js';
+import { z } from 'zod';
+import { ConfigValidationError, validateAssistantConfig, type AssistantConfig } from './config.js';
+import { AgentDatabase, type ContactAssignment } from './database.js';
 
 interface PanelOptions {
   configPath: string;
@@ -13,6 +15,8 @@ interface PanelOptions {
   password: string;
   getConfig: () => AssistantConfig;
   setConfig: (config: AssistantConfig) => void;
+  database: AgentDatabase;
+  setContactAssignment: (jid: string, assignment: ContactAssignment) => Promise<void>;
   logger: Logger;
 }
 
@@ -81,6 +85,65 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
           sendJson(response, 200, options.getConfig());
           return;
         }
+        if (request.method === 'GET' && url.pathname === '/api/contacts') {
+          sendJson(response, 200, options.database.listContacts());
+          return;
+        }
+        if (request.method === 'GET' && url.pathname === '/api/diagnostics') {
+          sendJson(response, 200, options.database.listDiagnostics());
+          return;
+        }
+        if (request.method === 'PUT' && url.pathname === '/api/contacts/assignment') {
+          if (!sameOrigin(request)) {
+            sendJson(response, 403, { error: 'Origem da requisição inválida.' });
+            return;
+          }
+          const body = await readJson(request);
+          const jid = normalizePhone(String(body.phone ?? body.jid ?? ''));
+          const assignment = body.assignment;
+          if (!jid || !['BOT', 'HUMANO', 'PAUSADO'].includes(String(assignment))) {
+            sendJson(response, 400, { error: 'Informe um telefone válido e uma atribuição BOT, HUMANO ou PAUSADO.' });
+            return;
+          }
+          const contactAssignment = assignment as ContactAssignment;
+          options.database.ensureContact(jid, 'PAUSADO', 'panel');
+          await options.setContactAssignment(jid, contactAssignment);
+          options.database.setContactAssignment(jid, contactAssignment, 'panel');
+          options.database.recordDiagnostic(jid, 'atribuicao', `Alterada no painel: ${contactAssignment}`);
+          sendJson(response, 200, { ok: true, jid, assignment: contactAssignment });
+          return;
+        }
+        if (request.method === 'POST' && url.pathname === '/api/contacts/import') {
+          if (!sameOrigin(request)) {
+            sendJson(response, 403, { error: 'Origem da requisição inválida.' });
+            return;
+          }
+          const body = await readJson(request);
+          const imported = parseContactCsv(String(body.csv ?? ''));
+          const results: Array<{ phone: string; assignment: string; ok: boolean; error?: string }> = [];
+          for (const row of imported) {
+            const jid = normalizePhone(row.phone);
+            if (!jid || !['BOT', 'HUMANO'].includes(row.assignment)) {
+              results.push({ phone: row.phone, assignment: row.assignment, ok: false, error: 'Telefone ou atribuição inválidos.' });
+              continue;
+            }
+            try {
+              const contactAssignment = row.assignment as ContactAssignment;
+              options.database.ensureContact(jid, 'PAUSADO', 'csv-import');
+              if (row.name) options.database.setContactName(jid, row.name.slice(0, 120));
+              await options.setContactAssignment(jid, contactAssignment);
+              options.database.setContactAssignment(jid, contactAssignment, 'csv-import');
+              options.database.recordDiagnostic(jid, 'importacao', `CSV: ${contactAssignment}`);
+              results.push({ phone: row.phone, assignment: row.assignment, ok: true });
+            } catch (error) {
+              const message = error instanceof Error ? error.message : 'Falha ao sincronizar etiqueta.';
+              options.database.recordDiagnostic(jid, 'falha-importacao', message);
+              results.push({ phone: row.phone, assignment: row.assignment, ok: false, error: message });
+            }
+          }
+          sendJson(response, 200, { imported: results.filter((row) => row.ok).length, results });
+          return;
+        }
         if (request.method === 'GET' && url.pathname === '/api/revisions') {
           await mkdir(revisionsDir, { recursive: true, mode: 0o700 });
           const files = (await readdir(revisionsDir)).filter((file) => file.endsWith('.json')).sort().reverse();
@@ -139,7 +202,10 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Erro interno';
       options.logger.error({ error: message }, 'Admin panel request failed');
-      if (!response.headersSent) sendJson(response, 400, { error: message });
+      const details = error instanceof z.ZodError
+        ? error.issues.map((issue) => ({ path: issue.path.join('.'), message: issue.message, fix: validationFix(issue.message) }))
+        : error instanceof ConfigValidationError ? [{ path: error.path, message: error.message, fix: error.fix }] : [];
+      if (!response.headersSent) sendJson(response, 400, { error: message, details });
       else response.destroy();
     }
   });
@@ -153,6 +219,55 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
   });
   options.logger.info({ host: options.host, port: options.port }, 'Painel de configuração disponível');
   return () => new Promise<void>((resolveClose, reject) => server.close((error) => error ? reject(error) : resolveClose()));
+}
+
+function validationFix(message: string): string {
+  if (message.includes('Too small') || message.includes('too_small')) return 'Preencha este campo antes de salvar.';
+  if (message.includes('Invalid input')) return 'Escolha um valor válido para este campo.';
+  return 'Revise o valor informado.';
+}
+
+function normalizePhone(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.endsWith('@s.whatsapp.net')) return trimmed;
+  const digits = trimmed.replace(/\D/g, '');
+  if (digits.length < 10 || digits.length > 15) return '';
+  return digits + '@s.whatsapp.net';
+}
+
+function parseContactCsv(csv: string): Array<{ phone: string; assignment: string; name?: string }> {
+  const lines = csv.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  if (lines.length > 1001) throw new Error('Importe no máximo 1.000 contatos por vez.');
+  const rows = lines.map(parseCsvLine);
+  const hasHeader = rows.length > 0 && rows[0]!.some((cell) => /^(telefone|phone|numero|nome|name|atribuicao|assignment)$/i.test(cell.trim()));
+  const headers = hasHeader ? rows.shift()!.map((item) => item.trim().toLowerCase()) : [];
+  return rows.map((cells) => {
+    const phoneIndex = headers.length ? headers.findIndex((name) => ['telefone', 'phone', 'numero'].includes(name)) : 0;
+    const assignmentIndex = headers.length ? headers.findIndex((name) => ['atribuicao', 'assignment'].includes(name)) : 1;
+    const nameIndex = headers.length ? headers.findIndex((name) => ['nome', 'name'].includes(name)) : 2;
+    const name = nameIndex >= 0 ? cells[nameIndex]?.trim() : undefined;
+    return {
+      phone: cells[phoneIndex >= 0 ? phoneIndex : 0] ?? '',
+      assignment: (cells[assignmentIndex >= 0 ? assignmentIndex : 1] ?? '').trim().toUpperCase(),
+      ...(name ? { name } : {}),
+    };
+  });
+}
+
+function parseCsvLine(line: string): string[] {
+  const delimiter = line.includes(';') ? ';' : ',';
+  const values: string[] = [];
+  let current = '';
+  let quoted = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index]!;
+    if (character === '"' && line[index + 1] === '"' && quoted) { current += '"'; index += 1; }
+    else if (character === '"') quoted = !quoted;
+    else if (character === delimiter && !quoted) { values.push(current.trim()); current = ''; }
+    else current += character;
+  }
+  values.push(current.trim());
+  return values;
 }
 
 async function resolvePanelPassword(configuredPassword: string): Promise<string> {

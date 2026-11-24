@@ -34,11 +34,15 @@
           <button class="nav-item" data-page="messages"><span class="nav-icon">◌</span> Mensagens</button>
           <button class="nav-item" data-page="knowledge"><span class="nav-icon">▤</span> Instruções e materiais</button>
           <button class="nav-item" data-page="preview"><span class="nav-icon">▹</span> Testar conversa</button>
+          <div class="nav-label nav-extra">OPERAÇÃO</div>
+          <button class="nav-item" data-page="contacts"><span class="nav-icon">♙</span> Contatos e etiquetas</button>
+          <button class="nav-item" data-page="diagnostics"><span class="nav-icon">◉</span> Fila e diagnósticos</button>
         </nav>
         <div class="sidebar-foot"><div class="connection-dot"></div><span>Painel local conectado</span><button id="logout" title="Sair">↗</button></div>
       </aside>
       <main class="main">
         <header class="topbar"><div><span class="crumb">Configuração do agente</span><span id="page-title" class="page-title">Visão geral</span></div><div class="top-actions"><span id="save-state" class="save-state">Alterações salvas</span><button id="restore" class="button quiet">Restaurar versão anterior</button><button id="save" class="button primary">Salvar alterações <span>↗</span></button></div></header>
+        <div id="validation-errors" class="error-summary hidden" role="alert"></div>
         <div id="content" class="content"></div>
       </main>
     </div>

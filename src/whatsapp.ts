@@ -11,19 +11,26 @@ import makeWASocket, {
 import qrcode from 'qrcode-terminal';
 import type { Logger } from 'pino';
 import type { RuntimeConfig } from './config.js';
-import type { IncomingMessage } from './database.js';
+import type { ContactAssignment, IncomingMessage } from './database.js';
 
 type MessageContent = NonNullable<WAMessage['message']>;
+type Label = { id: string; name: string; color: number; deleted: boolean };
+type LabelAssociation = { type: string; chatId: string; labelId: string };
 
 export interface WhatsAppConnection {
   sendText(jid: string, text: string): Promise<void>;
+  setContactAssignment(jid: string, assignment: ContactAssignment): Promise<void>;
+  renameContact(jid: string, name: string): Promise<void>;
   close(): Promise<void>;
 }
 
 export async function connectWhatsApp(
   config: RuntimeConfig,
   logger: Logger,
-  onIncoming: (message: IncomingMessage) => void,
+  onIncoming: (message: IncomingMessage) => Promise<void> | void,
+  onLabelEdit: (label: Label) => void,
+  onLabelAssociation: (association: LabelAssociation, add: boolean) => void,
+  getLabelId: (name: 'BOT' | 'HUMANO') => string | undefined,
 ): Promise<WhatsAppConnection> {
   await mkdir(config.authDir, { recursive: true, mode: 0o700 });
   await mkdir(config.mediaDir, { recursive: true, mode: 0o700 });
@@ -32,6 +39,27 @@ export async function connectWhatsApp(
   let reconnectTimer: NodeJS.Timeout | undefined;
   let closing = false;
   let pairingRequired = false;
+  const labelIds = new Map<string, string>();
+  const labelCreations = new Map<string, Promise<string>>();
+  const ensureLabel = async (jid: string, name: 'BOT' | 'HUMANO'): Promise<string> => {
+    let id = labelIds.get(name) ?? getLabelId(name);
+    if (id) return id;
+    const pending = labelCreations.get(name);
+    if (pending) return pending;
+    const creation = (async () => {
+      const createdId = randomUUID().replaceAll('-', '').slice(0, 12);
+      const label = { id: createdId, name, color: name === 'BOT' ? 2 : 7, deleted: false };
+      const activeSocket = socket;
+      if (!activeSocket) throw new Error('WhatsApp socket is not connected');
+      await activeSocket.addLabel(jid, { id: createdId, name, color: label.color });
+      labelIds.set(name, createdId);
+      onLabelEdit(label);
+      return createdId;
+    })();
+    labelCreations.set(name, creation);
+    try { return await creation; }
+    finally { labelCreations.delete(name); }
+  };
 
   const open = async (): Promise<void> => {
     if (closing || pairingRequired) return;
@@ -48,6 +76,20 @@ export async function connectWhatsApp(
     socket = nextSocket;
 
     nextSocket.ev.on('creds.update', saveCreds);
+    nextSocket.ev.on('labels.edit', (label) => {
+      if (label.name) {
+        const normalized = label.name.trim().toLocaleUpperCase('pt-BR');
+        if (normalized === 'BOT' || normalized === 'HUMANO') {
+          if (!label.deleted) labelIds.set(normalized, label.id);
+          else if (labelIds.get(normalized) === label.id) labelIds.delete(normalized);
+        }
+      }
+      onLabelEdit(label);
+    });
+    nextSocket.ev.on('labels.association', ({ association, type }) => {
+      if (association.type !== 'label_jid') return;
+      onLabelAssociation(association, type === 'add');
+    });
     nextSocket.ev.on('connection.update', (update) => {
       const { connection, qr, lastDisconnect } = update;
       if (qr) {
@@ -111,18 +153,40 @@ export async function connectWhatsApp(
   return {
     async sendText(jid, text) {
       if (!socket) throw new Error('WhatsApp socket is not connected');
-      if (config.assistant.simulateTyping && config.assistant.typingMsPerCharacter > 0) {
-        const typingDuration = Math.min(
-          12_000,
-          text.length * config.assistant.typingMsPerCharacter,
-        );
+      if (config.assistant.simulateTyping && config.assistant.typingSecondsPerCharacter > 0) {
+        const typingDuration = text.length * config.assistant.typingSecondsPerCharacter;
         await socket.sendPresenceUpdate('composing', jid).catch(() => undefined);
-        await new Promise((resolve) => setTimeout(resolve, typingDuration));
+        await delaySeconds(typingDuration);
       }
       await socket.sendMessage(jid, { text });
       if (config.assistant.simulateTyping) {
         await socket.sendPresenceUpdate('paused', jid).catch(() => undefined);
       }
+    },
+    async setContactAssignment(jid, assignment) {
+      if (!socket) throw new Error('WhatsApp socket is not connected');
+      const botId = await ensureLabel(jid, 'BOT');
+      const humanId = await ensureLabel(jid, 'HUMANO');
+      if (assignment === 'BOT') {
+        await socket.removeChatLabel(jid, humanId).catch(() => undefined);
+        await socket.addChatLabel(jid, botId);
+      } else if (assignment === 'HUMANO') {
+        await socket.removeChatLabel(jid, botId).catch(() => undefined);
+        await socket.addChatLabel(jid, humanId);
+      } else {
+        await socket.removeChatLabel(jid, botId).catch(() => undefined);
+        await socket.removeChatLabel(jid, humanId).catch(() => undefined);
+      }
+    },
+    async renameContact(jid, name) {
+      if (!socket) throw new Error('WhatsApp socket is not connected');
+      const cleaned = name.trim().replace(/\s+/g, ' ').slice(0, 120);
+      if (!cleaned) return;
+      await socket.addOrEditContact(jid, {
+        fullName: cleaned,
+        firstName: cleaned,
+        saveOnPrimaryAddressbook: true,
+      });
     },
     async close() {
       closing = true;
@@ -138,7 +202,7 @@ async function receiveMessage(
   message: WAMessage,
   config: RuntimeConfig,
   logger: Logger,
-  onIncoming: (message: IncomingMessage) => void,
+  onIncoming: (message: IncomingMessage) => Promise<void> | void,
 ): Promise<void> {
   const jid = message.key.remoteJid;
   const messageId = message.key.id;
@@ -156,7 +220,7 @@ async function receiveMessage(
   const content = unwrapContent(message.message);
   const text = extractText(content);
   if (text !== null) {
-    onIncoming({
+    await onIncoming({
       key: jid + ':' + messageId,
       jid,
       kind: 'text',
@@ -192,7 +256,7 @@ async function receiveMessage(
     );
   }
 
-  onIncoming({
+  await onIncoming({
     key: jid + ':' + messageId,
     jid,
     kind: 'audio',
@@ -242,4 +306,14 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function safeError(error: unknown): string {
   return error instanceof Error ? error.message : 'Unknown WhatsApp error';
+}
+
+async function delaySeconds(seconds: number): Promise<void> {
+  let remaining = seconds * 1000;
+  const largestSafeTimer = 2_147_000_000;
+  while (remaining > 0) {
+    const step = Math.min(remaining, largestSafeTimer);
+    await new Promise<void>((resolve) => setTimeout(resolve, step));
+    remaining -= step;
+  }
 }

@@ -35,6 +35,26 @@ export interface QueueJob {
   attempts: number;
 }
 
+export type ContactAssignment = 'BOT' | 'HUMANO' | 'PAUSADO';
+
+export interface ContactRecord {
+  jid: string;
+  phone: string;
+  displayName: string | null;
+  assignment: ContactAssignment;
+  source: string;
+  updatedAt: number;
+  lastActivityAt: number | null;
+}
+
+export interface DiagnosticRecord {
+  id: number;
+  jid: string;
+  event: string;
+  detail: string;
+  createdAt: number;
+}
+
 const EMPTY_STATE: ConversationState = {
   profileId: null,
   fields: {},
@@ -98,6 +118,36 @@ export class AgentDatabase {
       );
       CREATE INDEX IF NOT EXISTS outbox_pending
         ON outbox (status, id);
+      CREATE TABLE IF NOT EXISTS contacts (
+        jid TEXT PRIMARY KEY,
+        display_name TEXT,
+        assignment TEXT NOT NULL DEFAULT 'PAUSADO'
+          CHECK (assignment IN ('BOT', 'HUMANO', 'PAUSADO')),
+        source TEXT NOT NULL DEFAULT 'inbound',
+        updated_at INTEGER NOT NULL,
+        last_activity_at INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS wa_labels (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        color INTEGER NOT NULL DEFAULT 0,
+        deleted INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS contact_labels (
+        jid TEXT NOT NULL,
+        label_id TEXT NOT NULL,
+        PRIMARY KEY (jid, label_id),
+        FOREIGN KEY (jid) REFERENCES contacts(jid) ON DELETE CASCADE,
+        FOREIGN KEY (label_id) REFERENCES wa_labels(id) ON DELETE CASCADE
+      );
+      CREATE TABLE IF NOT EXISTS diagnostics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        jid TEXT NOT NULL,
+        event TEXT NOT NULL,
+        detail TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS diagnostics_created ON diagnostics (created_at DESC, id DESC);
     `);
     const messageColumns = this.db.prepare('PRAGMA table_info(messages)').all() as Array<{ name: string }>;
     if (!messageColumns.some((column) => column.name === 'first_contact')) {
@@ -114,6 +164,134 @@ export class AgentDatabase {
 
   setBatchWindowMs(milliseconds: number): void {
     this.batchWindowMs = milliseconds;
+  }
+
+  hasContact(jid: string): boolean {
+    return Boolean(this.db.prepare('SELECT 1 FROM contacts WHERE jid = ?').get(jid));
+  }
+
+  hasStoredMessages(jid: string): boolean {
+    return Boolean(this.db.prepare('SELECT 1 FROM messages WHERE jid = ? LIMIT 1').get(jid));
+  }
+
+  ensureContact(jid: string, assignment: ContactAssignment = 'PAUSADO', source = 'inbound'): void {
+    const now = Date.now();
+    this.db.prepare(
+      'INSERT OR IGNORE INTO contacts (jid, assignment, source, updated_at) VALUES (?, ?, ?, ?)',
+    ).run(jid, assignment, source, now);
+  }
+
+  setContactAssignment(jid: string, assignment: ContactAssignment, source: string): void {
+    this.ensureContact(jid, assignment, source);
+    const previous = this.getContactAssignment(jid);
+    this.db.prepare('UPDATE contacts SET assignment = ?, source = ?, updated_at = ? WHERE jid = ?')
+      .run(assignment, source, Date.now(), jid);
+    if (previous !== assignment || (assignment === 'BOT' && ['panel', 'csv-import'].includes(source))) {
+      this.applyAssignmentToConversation(jid, assignment);
+    }
+  }
+
+  getContactAssignment(jid: string): ContactAssignment | null {
+    const row = this.db.prepare('SELECT assignment FROM contacts WHERE jid = ?').get(jid) as { assignment: ContactAssignment } | undefined;
+    return row?.assignment ?? null;
+  }
+
+  hasExplicitBotAssignment(jid: string): boolean {
+    const row = this.db.prepare('SELECT assignment, source FROM contacts WHERE jid = ?').get(jid) as { assignment: ContactAssignment; source: string } | undefined;
+    return row?.assignment === 'BOT' && ['panel', 'csv-import', 'whatsapp-label'].includes(row.source);
+  }
+
+  getLabelIdByName(name: string): string | undefined {
+    const row = this.db.prepare('SELECT id FROM wa_labels WHERE upper(name) = upper(?) AND deleted = 0 ORDER BY id LIMIT 1').get(name) as { id: string } | undefined;
+    return row?.id;
+  }
+
+  saveLabel(id: string, name: string, color = 0, deleted = false): void {
+    this.db.prepare(
+      'INSERT INTO wa_labels (id, name, color, deleted) VALUES (?, ?, ?, ?) ' +
+      'ON CONFLICT(id) DO UPDATE SET name = excluded.name, color = excluded.color, deleted = excluded.deleted',
+    ).run(id, name, color, deleted ? 1 : 0);
+    const affected = this.db.prepare('SELECT DISTINCT jid FROM contact_labels WHERE label_id = ?').all(id) as Array<{ jid: string }>;
+    for (const contact of affected) this.recalculateContactAssignment(contact.jid);
+  }
+
+  getLabelName(id: string): string | undefined {
+    const row = this.db.prepare('SELECT name FROM wa_labels WHERE id = ? AND deleted = 0').get(id) as { name: string } | undefined;
+    return row?.name;
+  }
+
+  updateContactLabel(jid: string, labelId: string, name: string, add: boolean): void {
+    if (!this.getLabelName(labelId)) this.saveLabel(labelId, name);
+    this.ensureContact(jid, 'PAUSADO', 'whatsapp-label');
+    const transaction = this.db.transaction(() => {
+      if (add) {
+        this.db.prepare('INSERT OR IGNORE INTO contact_labels (jid, label_id) VALUES (?, ?)').run(jid, labelId);
+      } else {
+        this.db.prepare('DELETE FROM contact_labels WHERE jid = ? AND label_id = ?').run(jid, labelId);
+      }
+    });
+    transaction.immediate();
+    this.recalculateContactAssignment(jid);
+    this.recordDiagnostic(jid, 'etiqueta', `${add ? 'Adicionada' : 'Removida'}: ${name}`);
+  }
+
+  private recalculateContactAssignment(jid: string): void {
+    const names = this.db.prepare(
+      'SELECT upper(l.name) AS name FROM contact_labels cl JOIN wa_labels l ON l.id = cl.label_id ' +
+      'WHERE cl.jid = ? AND l.deleted = 0',
+    ).all(jid) as Array<{ name: string }>;
+    const assignment: ContactAssignment = names.some((label) => label.name === 'HUMANO')
+      ? 'HUMANO'
+      : names.some((label) => label.name === 'BOT') ? 'BOT' : 'PAUSADO';
+    const previous = this.getContactAssignment(jid);
+    this.db.prepare('UPDATE contacts SET assignment = ?, source = ?, updated_at = ? WHERE jid = ?')
+      .run(assignment, 'whatsapp-label', Date.now(), jid);
+    if (previous !== assignment) this.applyAssignmentToConversation(jid, assignment);
+  }
+
+  private applyAssignmentToConversation(jid: string, assignment: ContactAssignment): void {
+    const state = this.getConversationState(jid);
+    if (assignment === 'BOT') {
+      state.paused = false;
+      state.completed = false;
+      state.pendingFieldId = null;
+      state.skippedFields = [];
+      state.attempts = {};
+    } else {
+      state.paused = true;
+    }
+    this.saveConversationState(jid, state);
+  }
+
+  setContactName(jid: string, name: string): void {
+    this.ensureContact(jid);
+    this.db.prepare('UPDATE contacts SET display_name = ?, updated_at = ? WHERE jid = ?').run(name, Date.now(), jid);
+  }
+
+  listContacts(): ContactRecord[] {
+    return this.db.prepare(
+      'SELECT jid, replace(replace(jid, \'@s.whatsapp.net\', \'\'), \'@lid\', \'\') AS phone, ' +
+      'display_name AS displayName, assignment, source, updated_at AS updatedAt, last_activity_at AS lastActivityAt ' +
+      'FROM contacts ORDER BY coalesce(last_activity_at, updated_at) DESC LIMIT 1000',
+    ).all() as ContactRecord[];
+  }
+
+  setContactActivity(jid: string, at: number): void {
+    this.db.prepare('UPDATE contacts SET last_activity_at = ?, updated_at = ? WHERE jid = ?').run(at, Date.now(), jid);
+  }
+
+  recordDiagnostic(jid: string, event: string, detail = ''): void {
+    const result = this.db.prepare('INSERT INTO diagnostics (jid, event, detail, created_at) VALUES (?, ?, ?, ?)')
+      .run(jid, event, detail.slice(0, 1000), Date.now());
+    if (Number(result.lastInsertRowid) % 100 === 0) {
+      this.db.prepare('DELETE FROM diagnostics WHERE id <= ?').run(Number(result.lastInsertRowid) - 10_000);
+    }
+  }
+
+  listDiagnostics(limit = 200): DiagnosticRecord[] {
+    return this.db.prepare(
+      'SELECT id, jid, event, detail, created_at AS createdAt FROM diagnostics ORDER BY id DESC LIMIT ?',
+    ).all(Math.max(1, Math.min(500, limit))) as DiagnosticRecord[];
   }
 
   saveIncoming(message: IncomingMessage): void {
@@ -138,6 +316,14 @@ export class AgentDatabase {
       // Duplicate socket events are harmless and do not reschedule a reply.
       if (inserted.changes === 0) return;
 
+      this.db.prepare(
+        'UPDATE contacts SET last_activity_at = ?, updated_at = ? WHERE jid = ?',
+      ).run(message.createdAt, now, message.jid);
+      this.db.prepare(
+        'INSERT OR IGNORE INTO contacts (jid, assignment, source, updated_at, last_activity_at) VALUES (?, ?, ?, ?, ?)',
+      ).run(message.jid, 'PAUSADO', 'inbound', now, message.createdAt);
+      this.recordDiagnostic(message.jid, 'recebida', message.kind);
+
       const pending = this.db
         .prepare(
           'SELECT id FROM jobs ' +
@@ -160,6 +346,7 @@ export class AgentDatabase {
           )
           .run(message.jid, now + this.batchWindowMs, now, now);
       }
+      this.recordDiagnostic(message.jid, 'na-fila', 'Aguardando processamento');
     });
     transaction.immediate();
   }
