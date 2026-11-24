@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { mkdir } from 'node:fs/promises';
 import { pino } from 'pino';
+import { startAdminPanel } from './admin-panel.js';
 import { loadRuntimeConfig } from './config.js';
 import { AgentDatabase } from './database.js';
 import { GroqProvider } from './groq.js';
@@ -27,6 +28,18 @@ async function main(): Promise<void> {
     runtime.databasePath,
     runtime.assistant.batchWindowMs,
   );
+  const closePanel = await startAdminPanel({
+    configPath: runtime.qualificationPath,
+    host: process.env.PANEL_HOST ?? '127.0.0.1',
+    port: Number(process.env.PANEL_PORT ?? 3000),
+    password: process.env.PANEL_PASSWORD ?? '',
+    getConfig: () => runtime.assistant,
+    setConfig: (assistant) => {
+      runtime.assistant = assistant;
+      db.setBatchWindowMs(assistant.batchWindowMs);
+    },
+    logger,
+  });
   const provider = new GroqProvider(
     runtime.apiKey,
     runtime.chatModel,
@@ -44,7 +57,7 @@ async function main(): Promise<void> {
   const worker = new QualificationWorker(
     db,
     provider,
-    runtime.assistant,
+    () => runtime.assistant,
     runtime,
     whatsapp.sendText,
     logger,
@@ -57,6 +70,7 @@ async function main(): Promise<void> {
     stopping = true;
     logger.info('Encerrando agente');
     abort.abort();
+    await closePanel();
     await whatsapp.close();
     db.close();
     process.exit(0);

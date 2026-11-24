@@ -48,7 +48,7 @@ const EMPTY_STATE: ConversationState = {
 export class AgentDatabase {
   private readonly db: Database.Database;
 
-  constructor(databasePath: string, private readonly batchWindowMs: number) {
+  constructor(databasePath: string, private batchWindowMs: number) {
     mkdirSync(dirname(databasePath), { recursive: true, mode: 0o700 });
     this.db = new Database(databasePath);
     this.db.pragma('journal_mode = WAL');
@@ -64,7 +64,8 @@ export class AgentDatabase {
         body TEXT,
         media_path TEXT,
         created_at INTEGER NOT NULL,
-        processed_at INTEGER
+        processed_at INTEGER,
+        first_contact INTEGER NOT NULL DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS messages_jid_created
         ON messages (jid, created_at, id);
@@ -98,6 +99,10 @@ export class AgentDatabase {
       CREATE INDEX IF NOT EXISTS outbox_pending
         ON outbox (status, id);
     `);
+    const messageColumns = this.db.prepare('PRAGMA table_info(messages)').all() as Array<{ name: string }>;
+    if (!messageColumns.some((column) => column.name === 'first_contact')) {
+      this.db.exec('ALTER TABLE messages ADD COLUMN first_contact INTEGER NOT NULL DEFAULT 0');
+    }
 
     // A process restart must not strand a job in the transient processing state.
     this.db
@@ -107,14 +112,18 @@ export class AgentDatabase {
       .run('pending', Date.now(), 'processing');
   }
 
+  setBatchWindowMs(milliseconds: number): void {
+    this.batchWindowMs = milliseconds;
+  }
+
   saveIncoming(message: IncomingMessage): void {
     const now = Date.now();
     const transaction = this.db.transaction(() => {
       const inserted = this.db
         .prepare(
           'INSERT OR IGNORE INTO messages ' +
-            '(message_key, jid, direction, kind, body, media_path, created_at) ' +
-            "VALUES (?, ?, 'inbound', ?, ?, ?, ?)",
+            '(message_key, jid, direction, kind, body, media_path, created_at, first_contact) ' +
+            "VALUES (?, ?, 'inbound', ?, ?, ?, ?, CASE WHEN NOT EXISTS (SELECT 1 FROM messages WHERE jid = ?) THEN 1 ELSE 0 END)",
         )
         .run(
           message.key,
@@ -123,6 +132,7 @@ export class AgentDatabase {
           message.body,
           message.mediaPath,
           message.createdAt,
+          message.jid,
         );
 
       // Duplicate socket events are harmless and do not reschedule a reply.
@@ -152,6 +162,13 @@ export class AgentDatabase {
       }
     });
     transaction.immediate();
+  }
+
+  isFirstContact(jid: string): boolean {
+    const row = this.db
+      .prepare('SELECT 1 AS found FROM messages WHERE jid = ? AND first_contact = 1 LIMIT 1')
+      .get(jid) as { found: number } | undefined;
+    return row !== undefined;
   }
 
   claimDueJob(now = Date.now()): QueueJob | null {

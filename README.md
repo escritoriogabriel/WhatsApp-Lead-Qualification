@@ -1,6 +1,6 @@
 # WhatsApp Lead Qualification
 
-Agente de atendimento inicial para WhatsApp, com Baileys, perguntas configuráveis por fluxo, transcrição de áudios e encaminhamento para atendimento humano.
+Agente de atendimento inicial para WhatsApp, com painel visual, fluxos configuráveis, transcrição de áudios e encaminhamento para atendimento humano.
 
 > Esta é uma base de MVP. Baileys é uma integração não oficial e pode ser desconectada ou restringida pelo WhatsApp. Use um número de teste até validar o fluxo e aceite esse risco antes de conectar um número essencial do escritório.
 
@@ -13,6 +13,7 @@ Agente de atendimento inicial para WhatsApp, com Baileys, perguntas configuráve
 - Usa um modelo de texto compatível com a API da Groq para extrair respostas e escrever uma breve confirmação.
 - Seleciona a próxima pergunta apenas a partir do fluxo configurado; o modelo não escolhe a pergunta nem fornece aconselhamento jurídico.
 - Pode enviar confirmação e pergunta em mensagens separadas, com intervalo configurável.
+- Inclui painel web com senha, edição de fluxos e perguntas, instruções, materiais de apoio, prévia local e restauração da versão anterior.
 - Interrompe a automação em termos de urgência, comando de atendimento humano, falha repetida ou fim da triagem.
 - Guarda credenciais da sessão Baileys e banco local em data/, fora do repositório.
 
@@ -26,15 +27,19 @@ O processamento de áudio usa o endpoint de transcrição da Groq. O arquivo é 
 
 ## Configuração local
 
-    npm install
+    npm install --allow-git=all
     Copy-Item .env.example .env
     Copy-Item config/qualification.example.json config/qualification.json
 
-Preencha GROQ_API_KEY em .env. Ajuste config/qualification.json para definir o estilo, palavras de encaminhamento, perguntas e campos que devem ser coletados. Não coloque credenciais nesse arquivo.
+Preencha GROQ_API_KEY em .env. No primeiro início, o painel cria uma senha aleatória em `data/panel-password`; consulte esse arquivo localmente para entrar. Também é possível definir `PANEL_PASSWORD` no `.env`. Não coloque credenciais nos fluxos ou materiais.
 
     npm run dev
 
 Na primeira execução, escaneie o QR exibido no terminal usando o WhatsApp do número de teste. A sessão autenticada é gravada em data/auth/.
+
+O painel usa `http://127.0.0.1:3000` por padrão e grava as mudanças no arquivo de configuração sem reiniciar o processo. Em uma VM, mantenha a porta do painel fechada para a internet e acesse por túnel SSH, por exemplo `ssh -L 3000:127.0.0.1:3000 usuario@IP_DA_VM`; depois abra `http://localhost:3000` no navegador. A senha gerada na primeira inicialização fica em `data/panel-password` (ou defina uma senha própria, com pelo menos 12 caracteres, em `PANEL_PASSWORD`). Para publicar um endereço web, configure um domínio e HTTPS com o exemplo `deploy/Caddyfile.example`, mantendo o painel ligado apenas em `127.0.0.1`; não exponha a porta 3000 diretamente na internet.
+
+O painel permite configurar o estilo e limites de escrita, tópicos proibidos, memória institucional, materiais de texto, saudação, pergunta de área, cadência, simulação de digitação e limite de novos contatos. Cada fluxo admite perguntas abertas, sim/não, escolha única/múltipla, data e número, opções, orientação de estrutura e condições. A configuração ativa fica em `config/qualification.json`; cada gravação guarda uma cópia em `data/config-revisions`, mantendo as 20 versões mais recentes.
 
 ## Configurar um fluxo
 
@@ -61,6 +66,9 @@ Se nenhum gatilho corresponder, o perfil marcado como default é usado. O agente
 | CONFIG_PATH | Fluxos de qualificação; padrão config/qualification.json |
 | HUMAN_NOTIFY_JID | JID opcional da equipe para receber o resumo da triagem |
 | LOG_LEVEL | Nível de log do serviço |
+| PANEL_HOST | Interface de rede do painel; padrão `127.0.0.1` |
+| PANEL_PORT | Porta do painel; padrão `3000` |
+| PANEL_PASSWORD | Senha do painel; se vazia, uma senha aleatória é criada em `data/panel-password` |
 
 ## Persistência e filas
 
@@ -70,7 +78,7 @@ O áudio existe apenas em data/tmp/ enquanto é transcrito. Não faça backup de
 
 ## Implantação em EC2
 
-Copie o repositório para o servidor, instale Node.js 22+, execute npm ci, configure .env e config/qualification.json, depois compile e inicie:
+Copie o repositório para o servidor, instale Node.js 22+, execute `npm ci --allow-git=all`, configure `.env` e `config/qualification.json`, depois compile e inicie:
 
     npm run build
     npm start
@@ -87,7 +95,8 @@ Para manter o processo após fechar o SSH, use o serviço de exemplo em deploy/w
 
 ## Limitações atuais
 
-- Sem painel web; as perguntas e o estilo são alterados no JSON e requerem reiniciar o serviço.
+- Os materiais são inseridos como texto no painel; documentos PDF/DOCX não são processados automaticamente.
+- “Novo contato” significa contato sem histórico salvo pelo agente. O WhatsApp não informa a ele se o número era conhecido antes da instalação.
 - Sem comando remoto de pausa; mensagens com comando de atendimento humano pausam a conversa e deixam a equipe seguir manualmente.
 - O número e as perguntas ainda precisam ser configurados pelo escritório.
 - A API gratuita não promete limite ou disponibilidade constantes.

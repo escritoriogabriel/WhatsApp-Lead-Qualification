@@ -111,7 +111,18 @@ export async function connectWhatsApp(
   return {
     async sendText(jid, text) {
       if (!socket) throw new Error('WhatsApp socket is not connected');
+      if (config.assistant.simulateTyping && config.assistant.typingMsPerCharacter > 0) {
+        const typingDuration = Math.min(
+          12_000,
+          text.length * config.assistant.typingMsPerCharacter,
+        );
+        await socket.sendPresenceUpdate('composing', jid).catch(() => undefined);
+        await new Promise((resolve) => setTimeout(resolve, typingDuration));
+      }
       await socket.sendMessage(jid, { text });
+      if (config.assistant.simulateTyping) {
+        await socket.sendPresenceUpdate('paused', jid).catch(() => undefined);
+      }
     },
     async close() {
       closing = true;

@@ -19,11 +19,15 @@ export class QualificationWorker {
   constructor(
     private readonly db: AgentDatabase,
     private readonly provider: GroqProvider,
-    private readonly assistant: AssistantConfig,
+    private readonly getAssistant: () => AssistantConfig,
     private readonly runtime: RuntimeConfig,
     private readonly sendText: TextSender,
     private readonly logger: Logger,
   ) {}
+
+  private get assistant(): AssistantConfig {
+    return this.getAssistant();
+  }
 
   async run(signal: AbortSignal): Promise<void> {
     while (!signal.aborted) {
@@ -83,6 +87,11 @@ export class QualificationWorker {
     if (incoming.length === 0) return;
 
     const state = this.db.getConversationState(job.jid);
+    if (this.assistant.newContactsOnly && state.profileId === null && !this.db.isFirstContact(job.jid)) {
+      await this.removeTemporaryMedia(incoming);
+      this.db.markMessagesProcessed(incoming.map((message) => message.id));
+      return;
+    }
     if (state.paused) {
       await this.removeTemporaryMedia(incoming);
       this.db.markMessagesProcessed(incoming.map((message) => message.id));
@@ -164,17 +173,15 @@ export class QualificationWorker {
       profile,
       history,
       state.fields,
-      this.assistant.writingStyle,
-      this.assistant.officeName,
-      this.assistant.maxHistoryMessages,
+      this.assistant,
     );
     state.fields = { ...state.fields, ...extraction.capturedFields };
 
     let nextField = profile.fields.find(
       (field) =>
-        field.required &&
         !state.fields[field.id] &&
-        !state.skippedFields.includes(field.id),
+        !state.skippedFields.includes(field.id) &&
+        this.shouldAsk(field, state),
     );
 
     if (
@@ -188,9 +195,9 @@ export class QualificationWorker {
         state.skippedFields = [...state.skippedFields, nextField.id];
         nextField = profile.fields.find(
           (field) =>
-            field.required &&
             !state.fields[field.id] &&
-            !state.skippedFields.includes(field.id),
+            !state.skippedFields.includes(field.id) &&
+            this.shouldAsk(field, state),
         );
       }
     }
@@ -208,10 +215,14 @@ export class QualificationWorker {
       );
       await this.notifyHuman(job, job.jid, state, 'Triagem concluída');
     } else {
-      state.pendingFieldId = nextField.id;
+      const areaUnknown = firstTurn && !state.fields[this.assistant.areaFieldId];
+      const askedField = areaUnknown
+        ? profile.fields.find((field) => field.id === this.assistant.areaFieldId) ?? nextField
+        : nextField;
+      state.pendingFieldId = askedField.id;
       this.db.saveConversationState(job.jid, state);
       const parts = firstTurn
-        ? [this.assistant.greeting, nextField.question]
+        ? [this.assistant.greeting, areaUnknown ? this.assistant.areaQuestion : nextField.question]
         : [extraction.acknowledgement, nextField.question].filter(
             (part): part is string => Boolean(part),
           );
@@ -311,8 +322,13 @@ export class QualificationWorker {
     );
     if (!profile) return [];
     return profile.fields
-      .filter((field) => field.required && !state.fields[field.id])
+      .filter((field) => field.required && !state.fields[field.id] && this.shouldAsk(field, state))
       .map((field) => field.label);
+  }
+
+  private shouldAsk(field: IntakeProfile['fields'][number], state: ConversationState): boolean {
+    if (!field.askWhen) return true;
+    return normalize(state.fields[field.askWhen.fieldId] ?? '') === normalize(field.askWhen.value);
   }
 
   private isHumanCommand(text: string): boolean {
@@ -331,7 +347,11 @@ export class QualificationWorker {
     parts: string[],
     suffix: string,
   ): Promise<void> {
-    const selected = parts.filter((part) => part.trim().length > 0);
+    const messages = parts.filter((part) => part.trim().length > 0);
+    const maxMessages = this.assistant.maxMessagesPerTurn;
+    const selected = messages.length <= maxMessages
+      ? messages
+      : [...messages.slice(0, maxMessages - 1), messages.slice(maxMessages - 1).join('\n\n')];
     for (let index = 0; index < selected.length; index += 1) {
       if (index > 0 && this.assistant.sendPartDelayMs > 0) {
         await delay(this.assistant.sendPartDelayMs);

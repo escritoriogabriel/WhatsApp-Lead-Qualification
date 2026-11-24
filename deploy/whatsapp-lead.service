@@ -17,7 +17,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/whatsapp-lead-qualification/data
+ReadWritePaths=/opt/whatsapp-lead-qualification/data /opt/whatsapp-lead-qualification/config
 
 [Install]
 WantedBy=multi-user.target

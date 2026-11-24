@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f4f5f2" />
+    <title>Atendimento | Painel do agente</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <section id="login" class="login-screen">
+      <div class="login-card">
+        <div class="brand-mark">A</div>
+        <p class="eyebrow">PAINEL DO ESCRITÓRIO</p>
+        <h1>Configure seu atendimento</h1>
+        <p class="muted">Entre com a senha do painel para editar o agente de WhatsApp.</p>
+        <form id="login-form">
+          <label for="password">Senha do painel</label>
+          <input id="password" type="password" autocomplete="current-password" required autofocus />
+          <button class="button primary full" type="submit">Entrar no painel <span>→</span></button>
+          <p id="login-error" class="error" aria-live="polite"></p>
+        </form>
+      </div>
+    </section>
+
+    <div id="app" class="shell hidden">
+      <aside class="sidebar">
+        <div class="brand"><div class="brand-mark">A</div><div><strong>Atendimento</strong><small>AGENTE WHATSAPP</small></div></div>
+        <div class="nav-label">CONFIGURAÇÃO</div>
+        <nav id="nav">
+          <button class="nav-item active" data-page="overview"><span class="nav-icon">⌂</span> Visão geral</button>
+          <button class="nav-item" data-page="behavior"><span class="nav-icon">◷</span> Comportamento</button>
+          <button class="nav-item" data-page="flow"><span class="nav-icon">☷</span> Fluxos e perguntas</button>
+          <button class="nav-item" data-page="messages"><span class="nav-icon">◌</span> Mensagens</button>
+          <button class="nav-item" data-page="knowledge"><span class="nav-icon">▤</span> Instruções e materiais</button>
+          <button class="nav-item" data-page="preview"><span class="nav-icon">▹</span> Testar conversa</button>
+        </nav>
+        <div class="sidebar-foot"><div class="connection-dot"></div><span>Painel local conectado</span><button id="logout" title="Sair">↗</button></div>
+      </aside>
+      <main class="main">
+        <header class="topbar"><div><span class="crumb">Configuração do agente</span><span id="page-title" class="page-title">Visão geral</span></div><div class="top-actions"><span id="save-state" class="save-state">Alterações salvas</span><button id="restore" class="button quiet">Restaurar versão anterior</button><button id="save" class="button primary">Salvar alterações <span>↗</span></button></div></header>
+        <div id="content" class="content"></div>
+      </main>
+    </div>
+    <div id="toast" class="toast" aria-live="polite"></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
