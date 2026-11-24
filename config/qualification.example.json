@@ -1,0 +1,68 @@
+{
+  "officeName": "Escritório",
+  "assistantName": "Assistente virtual",
+  "writingStyle": "Escreva em português do Brasil, com tom acolhedor, claro e profissional. Use mensagens curtas. Não ofereça aconselhamento jurídico, não avalie chances e não prometa resultados. Seu papel é apenas acolher, entender o assunto e organizar informações para a equipe.",
+  "greeting": "Olá! Sou o assistente virtual do escritório. Vou fazer algumas perguntas iniciais para encaminhar seu atendimento. Se preferir falar com uma pessoa, escreva HUMANO.",
+  "handoffMessage": "Vou encaminhar seu atendimento para a equipe do escritório. Um profissional dará continuidade assim que possível.",
+  "audioRetryMessage": "Não consegui compreender esse áudio com segurança. Você pode reenviá-lo ou resumir por escrito?",
+  "completionMessage": "Obrigado pelas informações. Vou encaminhar o resumo para a equipe do escritório.",
+  "urgencyMessage": "Entendi que pode haver urgência. Vou interromper as perguntas e encaminhar seu relato para a equipe.",
+  "batchWindowMs": 3000,
+  "sendPartDelayMs": 700,
+  "maxMessagesPerTurn": 2,
+  "maxFieldAttempts": 2,
+  "maxAudioBytes": 25000000,
+  "maxHistoryMessages": 16,
+  "workerPollMs": 500,
+  "handoffKeywords": [
+    "audiência hoje",
+    "audiência amanhã",
+    "prazo hoje",
+    "prazo amanhã",
+    "preso",
+    "prisão",
+    "medida protetiva",
+    "risco imediato"
+  ],
+  "humanCommand": "HUMANO",
+  "defaultProfileId": "triagem-inicial",
+  "profiles": [
+    {
+      "id": "triagem-inicial",
+      "label": "Triagem inicial",
+      "triggers": [],
+      "fields": [
+        {
+          "id": "nome",
+          "label": "Nome",
+          "question": "Como você gostaria de ser chamado(a)?",
+          "required": true
+        },
+        {
+          "id": "assunto",
+          "label": "Assunto",
+          "question": "Em poucas palavras, qual assunto você gostaria de tratar com o escritório?",
+          "required": true
+        },
+        {
+          "id": "local",
+          "label": "Local",
+          "question": "Em qual cidade e estado ocorreu ou está sendo tratado o caso?",
+          "required": true
+        },
+        {
+          "id": "prazo",
+          "label": "Prazo ou audiência",
+          "question": "Existe algum prazo, audiência ou data próxima que a equipe precise saber?",
+          "required": true
+        },
+        {
+          "id": "processo",
+          "label": "Processo e representação",
+          "question": "Já existe processo ou outro(a) advogado(a) acompanhando o caso?",
+          "required": false
+        }
+      ]
+    }
+  ]
+}
