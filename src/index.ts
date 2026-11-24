@@ -52,19 +52,25 @@ async function main(): Promise<void> {
     runtime.transcriptionModel,
   );
   whatsapp = await connectWhatsApp(runtime, logger, async (message) => {
-    const isNew = !db.hasStoredMessages(message.jid) && !db.hasContact(message.jid);
     if (!db.hasContact(message.jid)) {
-      db.ensureContact(message.jid, isNew ? 'BOT' : 'PAUSADO', isNew ? 'new-lead' : 'legacy-contact');
+      db.ensureContact(message.jid, 'PAUSADO', 'new-lead');
     }
-    if (isNew) {
+    let assignment = db.getContactAssignment(message.jid);
+    if (assignment !== 'HUMANO' && assignment !== 'BOT') {
       try {
         if (!whatsapp) throw new Error('WhatsApp ainda está inicializando.');
+        // Every unassigned inbound conversation is first catalogued in Novo Lead,
+        // then moved to the only list eligible for automated qualification.
+        await whatsapp.setContactAssignment(message.jid, 'PAUSADO');
+        db.setContactAssignment(message.jid, 'PAUSADO', 'new-lead');
         await whatsapp.setContactAssignment(message.jid, 'BOT');
         db.setContactAssignment(message.jid, 'BOT', 'new-lead');
+        assignment = 'BOT';
       } catch (error) {
-        db.setContactAssignment(message.jid, 'BOT', 'new-lead-local-fallback');
-        db.recordDiagnostic(message.jid, 'falha-etiqueta', error instanceof Error ? error.message : 'Não foi possível aplicar etiqueta BOT');
-        logger.error({ jid: message.jid, error: error instanceof Error ? error.message : String(error) }, 'Falha ao aplicar etiqueta BOT ao novo lead');
+        db.setContactAssignment(message.jid, 'PAUSADO', 'new-lead-list-failed');
+        const detail = error instanceof Error ? error.message : String(error);
+        db.recordDiagnostic(message.jid, 'falha-lista', `O lead ficou em Novo Lead/Pausado; não entrou em Bot - atendimento: ${detail}`);
+        logger.error({ jid: message.jid, error: detail }, 'Falha ao mover novo lead para a lista Bot - atendimento');
       }
     }
     db.saveIncoming(message);

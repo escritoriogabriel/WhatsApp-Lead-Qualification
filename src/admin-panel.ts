@@ -1,7 +1,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { mkdir, readFile, readdir, rename, writeFile, unlink } from 'node:fs/promises';
-import { dirname, extname, join, resolve } from 'node:path';
+import { basename, dirname, extname, join, resolve } from 'node:path';
+import busboy from 'busboy';
+import yauzl from 'yauzl';
 import type { Logger } from 'pino';
 import { z } from 'zod';
 import { ConfigValidationError, validateAssistantConfig, type AssistantConfig } from './config.js';
@@ -21,6 +23,8 @@ interface PanelOptions {
 }
 
 const MAX_BODY_BYTES = 300_000;
+const MAX_UPLOAD_FILE_BYTES = 15 * 1024 * 1024;
+const MAX_UPLOAD_TOTAL_BYTES = 25 * 1024 * 1024;
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 
 export async function startAdminPanel(options: PanelOptions): Promise<() => Promise<void>> {
@@ -85,6 +89,55 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
           sendJson(response, 200, options.getConfig());
           return;
         }
+        if (request.method === 'POST' && url.pathname === '/api/materials/import') {
+          if (!sameOrigin(request)) {
+            sendJson(response, 403, { error: 'Origem da requisição inválida.' });
+            return;
+          }
+          const uploads = await readUploads(request);
+          const materials = [...options.getConfig().materials];
+          const results: Array<{ file: string; ok: boolean; detail: string }> = [];
+          let totalCharacters = materials.reduce((sum, item) => sum + item.content.length, 0);
+          for (const upload of uploads) {
+            try {
+              const documents = upload.tooLarge
+                ? []
+                : extname(upload.filename).toLowerCase() === '.zip'
+                  ? await extractZipDocuments(upload.buffer)
+                  : [{ filename: upload.filename, buffer: upload.buffer }];
+              if (upload.tooLarge) throw new Error('Arquivo maior que o limite de 15 MB.');
+              if (documents.length === 0) throw new Error('O arquivo não contém documentos em formatos compatíveis.');
+              let imported = 0;
+              const problems: string[] = [];
+              for (const document of documents) {
+                try {
+                  if (document.problem) throw new Error(document.problem);
+                  if (materials.length >= 20) throw new Error('Limite de 20 materiais atingido.');
+                  const content = await extractDocumentText(document.filename, document.buffer);
+                  const remaining = 20_000 - totalCharacters;
+                  if (content.length > remaining) throw new Error('O limite conjunto de 20.000 caracteres seria excedido. Remova materiais antigos ou reduza os arquivos.');
+                  if (!content.trim()) throw new Error('Nenhum texto legível foi encontrado. PDFs digitalizados precisam de OCR.');
+                  materials.push({ title: basenameSafe(document.filename).slice(0, 160), content });
+                  totalCharacters += content.length;
+                  imported += 1;
+                } catch (error) {
+                  problems.push(`${document.filename}: ${error instanceof Error ? error.message : 'falha ao ler'}`);
+                }
+              }
+              results.push({ file: upload.filename, ok: imported > 0, detail: `${imported} material(is) importado(s)${problems.length ? `; ${problems.join('; ')}` : ''}` });
+            } catch (error) {
+              results.push({ file: upload.filename, ok: false, detail: error instanceof Error ? error.message : 'Falha ao importar arquivo.' });
+            }
+          }
+          if (materials.length !== options.getConfig().materials.length) {
+            const candidate = validateAssistantConfig({ ...options.getConfig(), materials });
+            await saveRevision(options.configPath, revisionsDir);
+            await atomicWrite(options.configPath, JSON.stringify(candidate, null, 2) + '\n');
+            options.setConfig(candidate);
+          }
+          sendJson(response, 200, { imported: results.filter((item) => item.ok).length, results });
+          return;
+        }
         if (request.method === 'GET' && url.pathname === '/api/contacts') {
           sendJson(response, 200, options.database.listContacts());
           return;
@@ -100,12 +153,12 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
           }
           const body = await readJson(request);
           const jid = normalizePhone(String(body.phone ?? body.jid ?? ''));
-          const assignment = body.assignment;
-          if (!jid || !['BOT', 'HUMANO', 'PAUSADO'].includes(String(assignment))) {
-            sendJson(response, 400, { error: 'Informe um telefone válido e uma atribuição BOT, HUMANO ou PAUSADO.' });
+          const assignment = normalizeAssignment(body.assignment);
+          if (!jid || !assignment) {
+            sendJson(response, 400, { error: 'Informe um telefone válido e a lista Novo Lead, Bot - atendimento ou Atendimento.' });
             return;
           }
-          const contactAssignment = assignment as ContactAssignment;
+          const contactAssignment = assignment;
           options.database.ensureContact(jid, 'PAUSADO', 'panel');
           await options.setContactAssignment(jid, contactAssignment);
           options.database.setContactAssignment(jid, contactAssignment, 'panel');
@@ -123,12 +176,13 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
           const results: Array<{ phone: string; assignment: string; ok: boolean; error?: string }> = [];
           for (const row of imported) {
             const jid = normalizePhone(row.phone);
-            if (!jid || !['BOT', 'HUMANO'].includes(row.assignment)) {
-              results.push({ phone: row.phone, assignment: row.assignment, ok: false, error: 'Telefone ou atribuição inválidos.' });
+            const assignment = normalizeAssignment(row.assignment);
+            if (!jid || !assignment) {
+              results.push({ phone: row.phone, assignment: row.assignment, ok: false, error: 'Telefone ou lista inválidos. Use NOVO_LEAD, BOT ou HUMANO.' });
               continue;
             }
             try {
-              const contactAssignment = row.assignment as ContactAssignment;
+              const contactAssignment = assignment;
               options.database.ensureContact(jid, 'PAUSADO', 'csv-import');
               if (row.name) options.database.setContactName(jid, row.name.slice(0, 120));
               await options.setContactAssignment(jid, contactAssignment);
@@ -221,6 +275,128 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
   return () => new Promise<void>((resolveClose, reject) => server.close((error) => error ? reject(error) : resolveClose()));
 }
 
+interface UploadFile { filename: string; buffer: Buffer; tooLarge: boolean }
+interface ZipDocument { filename: string; buffer: Buffer; problem?: string }
+
+function readUploads(request: IncomingMessage): Promise<UploadFile[]> {
+  return new Promise((resolvePromise, reject) => {
+    let totalBytes = 0;
+    let totalLimitReached = false;
+    const uploads: Promise<UploadFile>[] = [];
+    let parser: ReturnType<typeof busboy>;
+    try {
+      parser = busboy({ headers: request.headers, limits: { files: 20, fileSize: MAX_UPLOAD_FILE_BYTES, fields: 0, parts: 20 } });
+    } catch (error) { reject(error); return; }
+    parser.on('file', (_field, stream, info) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      let tooLarge = false;
+      stream.on('data', (chunk: Buffer) => {
+        size += chunk.length;
+        totalBytes += chunk.length;
+        if (size > MAX_UPLOAD_FILE_BYTES || totalBytes > MAX_UPLOAD_TOTAL_BYTES) {
+          tooLarge = true;
+          if (totalBytes > MAX_UPLOAD_TOTAL_BYTES) totalLimitReached = true;
+        } else if (!totalLimitReached) chunks.push(chunk);
+      });
+      stream.on('limit', () => { tooLarge = true; });
+      uploads.push(new Promise((resolveFile, rejectFile) => {
+        stream.on('error', rejectFile);
+        stream.on('end', () => resolveFile({ filename: basename(info.filename || 'arquivo'), buffer: Buffer.concat(chunks), tooLarge: tooLarge || totalLimitReached }));
+      }));
+    });
+    parser.once('error', reject);
+    parser.once('close', () => {
+      void Promise.all(uploads).then(resolvePromise, reject);
+    });
+    request.once('error', reject);
+    request.pipe(parser);
+  });
+}
+
+async function extractZipDocuments(buffer: Buffer): Promise<ZipDocument[]> {
+  return new Promise((resolvePromise, reject) => {
+    yauzl.fromBuffer(buffer, { lazyEntries: true, validateEntrySizes: true, decodeStrings: true }, (error, zip) => {
+      if (error || !zip) { reject(error ?? new Error('Arquivo ZIP inválido.')); return; }
+      const documents: ZipDocument[] = [];
+      let count = 0;
+      let expandedBytes = 0;
+      let settled = false;
+      const fail = (reason: Error) => { if (!settled) { settled = true; zip.close(); reject(reason); } };
+      zip.on('error', fail);
+      zip.on('end', () => { if (!settled) { settled = true; resolvePromise(documents); } });
+      zip.on('entry', (entry) => {
+        count += 1;
+        if (count > 40) { fail(new Error('O ZIP contém mais de 40 arquivos.')); return; }
+        const extension = extname(entry.fileName).toLowerCase();
+        if (entry.fileName.endsWith('/')) { zip.readEntry(); return; }
+        const filename = entry.fileName.replaceAll('\\', '/').split('/').at(-1) || entry.fileName;
+        if (!isSupportedMaterialExtension(extension)) {
+          documents.push({ filename, buffer: Buffer.alloc(0), problem: 'Formato interno não compatível.' });
+          zip.readEntry(); return;
+        }
+        if ((entry.generalPurposeBitFlag & 1) !== 0) {
+          documents.push({ filename, buffer: Buffer.alloc(0), problem: 'Arquivo ZIP protegido por senha não pode ser lido.' });
+          zip.readEntry(); return;
+        }
+        if (entry.uncompressedSize > 10 * 1024 * 1024 || expandedBytes + entry.uncompressedSize > 25 * 1024 * 1024) {
+          documents.push({ filename, buffer: Buffer.alloc(0), problem: 'Arquivo descompactado excede o limite permitido.' });
+          zip.readEntry(); return;
+        }
+        expandedBytes += entry.uncompressedSize;
+        zip.openReadStream(entry, (streamError, stream) => {
+          if (streamError || !stream) { fail(streamError ?? new Error('Não foi possível abrir um arquivo do ZIP.')); return; }
+          const chunks: Buffer[] = [];
+          let size = 0;
+          stream.on('data', (chunk: Buffer) => {
+            size += chunk.length;
+            if (size > 10 * 1024 * 1024) { stream.destroy(new Error('Arquivo descompactado excedeu o limite.')); return; }
+            chunks.push(chunk);
+          });
+          stream.once('error', fail);
+          stream.once('end', () => {
+            documents.push({ filename, buffer: Buffer.concat(chunks) });
+            zip.readEntry();
+          });
+        });
+      });
+      zip.readEntry();
+    });
+  });
+}
+
+function isSupportedMaterialExtension(extension: string): boolean {
+  return ['.pdf', '.txt', '.md', '.markdown', '.csv', '.json', '.docx'].includes(extension);
+}
+
+async function extractDocumentText(filename: string, buffer: Buffer): Promise<string> {
+  const extension = extname(filename).toLowerCase();
+  if (extension === '.pdf') {
+    const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+    const document = await pdfjs.getDocument({ data: new Uint8Array(buffer), isEvalSupported: false }).promise;
+    try {
+      const pages: string[] = [];
+      for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
+        const page = await document.getPage(pageNumber);
+        const text = await page.getTextContent();
+        pages.push(text.items.map((item) => 'str' in item ? item.str : '').join(' '));
+      }
+      return pages.join('\n\n').trim();
+    } finally { await document.destroy(); }
+  }
+  if (extension === '.docx') {
+    const mammoth = await import('mammoth');
+    return (await mammoth.extractRawText({ buffer })).value.trim();
+  }
+  if (!isSupportedMaterialExtension(extension)) throw new Error('Formato não aceito. Use PDF, TXT, MD, CSV, JSON ou DOCX.');
+  const text = new TextDecoder('utf-8').decode(buffer).replaceAll('\u0000', '').trim();
+  return text;
+}
+
+function basenameSafe(value: string): string {
+  return basename(value.replaceAll('\\', '/'));
+}
+
 function validationFix(message: string): string {
   if (message.includes('Too small') || message.includes('too_small')) return 'Preencha este campo antes de salvar.';
   if (message.includes('Invalid input')) return 'Escolha um valor válido para este campo.';
@@ -229,10 +405,18 @@ function validationFix(message: string): string {
 
 function normalizePhone(value: string): string {
   const trimmed = value.trim();
-  if (trimmed.endsWith('@s.whatsapp.net')) return trimmed;
+  if (trimmed.endsWith('@s.whatsapp.net') || trimmed.endsWith('@lid')) return trimmed;
   const digits = trimmed.replace(/\D/g, '');
   if (digits.length < 10 || digits.length > 15) return '';
   return digits + '@s.whatsapp.net';
+}
+
+function normalizeAssignment(value: unknown): ContactAssignment | null {
+  const normalized = String(value ?? '').trim().toLocaleLowerCase('pt-BR').replaceAll('_', ' ').replaceAll('-', ' ').replace(/\s+/g, ' ');
+  if (normalized === 'bot' || normalized === 'bot atendimento') return 'BOT';
+  if (normalized === 'humano' || normalized === 'atendimento') return 'HUMANO';
+  if (normalized === 'pausado' || normalized === 'novo lead') return 'PAUSADO';
+  return null;
 }
 
 function parseContactCsv(csv: string): Array<{ phone: string; assignment: string; name?: string }> {

@@ -102,21 +102,21 @@ export class QualificationWorker {
     if (assignment !== 'BOT') {
       await this.removeTemporaryMedia(incoming);
       this.db.markMessagesProcessed(incoming.map((message) => message.id));
-      this.db.recordDiagnostic(job.jid, 'ignorada', `Sem etiqueta BOT (atribuição: ${assignment ?? 'desconhecida'})`);
-      this.logger.info({ jid: job.jid, assignment }, 'Mensagem ignorada: contato sem etiqueta BOT');
+      this.db.recordDiagnostic(job.jid, 'ignorada', `Contato fora da lista Bot - atendimento (atribuição local: ${assignment ?? 'desconhecida'})`);
+      this.logger.info({ jid: job.jid, assignment }, 'Mensagem ignorada: contato fora da lista Bot - atendimento');
       return;
     }
     if (this.assistant.newContactsOnly && state.profileId === null && !this.db.isFirstContact(job.jid) && !this.db.hasExplicitBotAssignment(job.jid)) {
       await this.removeTemporaryMedia(incoming);
       this.db.markMessagesProcessed(incoming.map((message) => message.id));
-      this.db.recordDiagnostic(job.jid, 'ignorada', 'Regra de somente novos contatos; atribua BOT explicitamente para reativar');
+      this.db.recordDiagnostic(job.jid, 'ignorada', 'Regra de somente novos contatos; mova o contato para Bot - atendimento no painel ou WhatsApp para reativar');
       return;
     }
     if (state.paused) {
       await this.removeTemporaryMedia(incoming);
       this.db.markMessagesProcessed(incoming.map((message) => message.id));
-      this.db.recordDiagnostic(job.jid, 'ignorada', 'Conversa pausada; reaplique a etiqueta BOT para reativar');
-      this.logger.info({ jid: job.jid }, 'Mensagem ignorada: conversa pausada');
+      this.db.recordDiagnostic(job.jid, 'ignorada', 'Conversa pausada; mova o contato para a lista Bot - atendimento para reativar');
+      this.logger.info({ jid: job.jid }, 'Mensagem ignorada: conversa fora da lista Bot - atendimento');
       return;
     }
 
@@ -367,8 +367,8 @@ export class QualificationWorker {
       await this.contacts.setContactAssignment(jid, assignment);
     } catch (error) {
       const message = safeError(error);
-      this.logger.warn({ jid, assignment, error: message }, 'Atribuição local aplicada; falha ao sincronizar etiqueta WhatsApp');
-      this.db.recordDiagnostic(jid, 'falha-etiqueta', message);
+      this.logger.warn({ jid, assignment, error: message }, 'Atribuição local aplicada; falha ao sincronizar lista do WhatsApp');
+      this.db.recordDiagnostic(jid, 'falha-lista', message);
     }
     this.db.setContactAssignment(jid, assignment, source);
   }

@@ -14,6 +14,7 @@ import type { RuntimeConfig } from './config.js';
 import type { ContactAssignment, IncomingMessage } from './database.js';
 
 type MessageContent = NonNullable<WAMessage['message']>;
+const listNames = ['Novo Lead', 'Bot - atendimento', 'Atendimento'] as const;
 type Label = { id: string; name: string; color: number; deleted: boolean };
 type LabelAssociation = { type: string; chatId: string; labelId: string };
 
@@ -30,7 +31,7 @@ export async function connectWhatsApp(
   onIncoming: (message: IncomingMessage) => Promise<void> | void,
   onLabelEdit: (label: Label) => void,
   onLabelAssociation: (association: LabelAssociation, add: boolean) => void,
-  getLabelId: (name: 'BOT' | 'HUMANO') => string | undefined,
+  getLabelId: (name: string) => string | undefined,
 ): Promise<WhatsAppConnection> {
   await mkdir(config.authDir, { recursive: true, mode: 0o700 });
   await mkdir(config.mediaDir, { recursive: true, mode: 0o700 });
@@ -41,14 +42,14 @@ export async function connectWhatsApp(
   let pairingRequired = false;
   const labelIds = new Map<string, string>();
   const labelCreations = new Map<string, Promise<string>>();
-  const ensureLabel = async (jid: string, name: 'BOT' | 'HUMANO'): Promise<string> => {
+  const ensureLabel = async (jid: string, name: (typeof listNames)[number]): Promise<string> => {
     let id = labelIds.get(name) ?? getLabelId(name);
     if (id) return id;
     const pending = labelCreations.get(name);
     if (pending) return pending;
     const creation = (async () => {
       const createdId = randomUUID().replaceAll('-', '').slice(0, 12);
-      const label = { id: createdId, name, color: name === 'BOT' ? 2 : 7, deleted: false };
+      const label = { id: createdId, name, color: name === 'Atendimento' ? 7 : name === 'Novo Lead' ? 4 : 2, deleted: false };
       const activeSocket = socket;
       if (!activeSocket) throw new Error('WhatsApp socket is not connected');
       await activeSocket.addLabel(jid, { id: createdId, name, color: label.color });
@@ -78,8 +79,8 @@ export async function connectWhatsApp(
     nextSocket.ev.on('creds.update', saveCreds);
     nextSocket.ev.on('labels.edit', (label) => {
       if (label.name) {
-        const normalized = label.name.trim().toLocaleUpperCase('pt-BR');
-        if (normalized === 'BOT' || normalized === 'HUMANO') {
+        const normalized = normalizeListName(label.name);
+        if (normalized) {
           if (!label.deleted) labelIds.set(normalized, label.id);
           else if (labelIds.get(normalized) === label.id) labelIds.delete(normalized);
         }
@@ -165,18 +166,15 @@ export async function connectWhatsApp(
     },
     async setContactAssignment(jid, assignment) {
       if (!socket) throw new Error('WhatsApp socket is not connected');
-      const botId = await ensureLabel(jid, 'BOT');
-      const humanId = await ensureLabel(jid, 'HUMANO');
-      if (assignment === 'BOT') {
-        await socket.removeChatLabel(jid, humanId).catch(() => undefined);
-        await socket.addChatLabel(jid, botId);
-      } else if (assignment === 'HUMANO') {
-        await socket.removeChatLabel(jid, botId).catch(() => undefined);
-        await socket.addChatLabel(jid, humanId);
-      } else {
-        await socket.removeChatLabel(jid, botId).catch(() => undefined);
-        await socket.removeChatLabel(jid, humanId).catch(() => undefined);
+      const target = assignment === 'BOT' ? 'Bot - atendimento' : assignment === 'HUMANO' ? 'Atendimento' : 'Novo Lead';
+      const ids = await Promise.all(listNames.map((name) => ensureLabel(jid, name)));
+      const targetId = ids[listNames.indexOf(target)];
+      for (const id of ids) if (id !== targetId) await socket.removeChatLabel(jid, id).catch(() => undefined);
+      for (const legacyName of ['BOT', 'HUMANO']) {
+        const legacyId = getLabelId(legacyName);
+        if (legacyId) await socket.removeChatLabel(jid, legacyId).catch(() => undefined);
       }
+      await socket.addChatLabel(jid, targetId!);
     },
     async renameContact(jid, name) {
       if (!socket) throw new Error('WhatsApp socket is not connected');
@@ -195,6 +193,14 @@ export async function connectWhatsApp(
       socket = null;
     },
   };
+}
+
+function normalizeListName(name: string): (typeof listNames)[number] | undefined {
+  const normalized = name.trim().toLocaleLowerCase('pt-BR');
+  if (normalized === 'novo lead') return 'Novo Lead';
+  if (normalized === 'bot - atendimento') return 'Bot - atendimento';
+  if (normalized === 'atendimento' || normalized === 'humano') return 'Atendimento';
+  return undefined;
 }
 
 async function receiveMessage(

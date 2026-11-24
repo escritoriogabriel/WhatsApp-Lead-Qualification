@@ -198,7 +198,7 @@ export class AgentDatabase {
 
   hasExplicitBotAssignment(jid: string): boolean {
     const row = this.db.prepare('SELECT assignment, source FROM contacts WHERE jid = ?').get(jid) as { assignment: ContactAssignment; source: string } | undefined;
-    return row?.assignment === 'BOT' && ['panel', 'csv-import', 'whatsapp-label'].includes(row.source);
+    return row?.assignment === 'BOT' && ['panel', 'csv-import', 'whatsapp-label', 'new-lead'].includes(row.source);
   }
 
   getLabelIdByName(name: string): string | undefined {
@@ -240,9 +240,10 @@ export class AgentDatabase {
       'SELECT upper(l.name) AS name FROM contact_labels cl JOIN wa_labels l ON l.id = cl.label_id ' +
       'WHERE cl.jid = ? AND l.deleted = 0',
     ).all(jid) as Array<{ name: string }>;
-    const assignment: ContactAssignment = names.some((label) => label.name === 'HUMANO')
+    const normalized = names.map((label) => label.name.trim().toLocaleLowerCase('pt-BR'));
+    const assignment: ContactAssignment = normalized.some((name) => name === 'atendimento' || name === 'humano')
       ? 'HUMANO'
-      : names.some((label) => label.name === 'BOT') ? 'BOT' : 'PAUSADO';
+      : normalized.some((name) => name === 'bot - atendimento') ? 'BOT' : 'PAUSADO';
     const previous = this.getContactAssignment(jid);
     this.db.prepare('UPDATE contacts SET assignment = ?, source = ?, updated_at = ? WHERE jid = ?')
       .run(assignment, 'whatsapp-label', Date.now(), jid);

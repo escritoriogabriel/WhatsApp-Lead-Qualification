@@ -35,7 +35,7 @@ const AssistantConfigSchema = z.object({
   writingStyle: z.string().min(1),
   officeMemory: z.string().max(5000).default(''),
   forbiddenTopics: z.array(z.string().min(1).max(200)).max(50).default([]),
-  materials: z.array(z.object({ title: z.string().min(1).max(160), content: z.string().min(1).max(6000) })).max(20).default([]),
+  materials: z.array(z.object({ title: z.string().min(1).max(160), content: z.string().min(1).max(20_000) })).max(20).default([]),
   greeting: z.string().min(1),
   areaQuestion: z.string().min(1).max(500).default('Qual área do Direito ou assunto melhor descreve o seu caso?'),
   areaFieldId: z.string().min(1).max(64).default('assunto'),

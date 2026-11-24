@@ -14,7 +14,7 @@ Agente de atendimento inicial para WhatsApp, com painel visual, fluxos configur�
 - Seleciona a próxima pergunta apenas a partir do fluxo configurado; o modelo não escolhe a pergunta nem fornece aconselhamento jurídico.
 - Pode enviar confirmação e pergunta em mensagens separadas, com intervalo configurável.
 - Inclui painel web com senha, edição de fluxos e perguntas, instruções, materiais de apoio, prévia local e restauração da versão anterior.
-- Organiza contatos por etiquetas `BOT` e `HUMANO`; contatos sem etiqueta reconhecida ficam pausados. Um novo lead recebe `BOT` automaticamente.
+- Organiza contatos pelas listas do WhatsApp `Novo Lead`, `Bot - atendimento` e `Atendimento`. Um novo contato entra em `Novo Lead` e, após a sincronização, é movido para `Bot - atendimento`; somente essa lista pode ser atendida pelo agente. `Atendimento` prevalece em caso de conflito.
 - Permite atribuir contatos pelo painel, importar uma lista CSV e consultar diagnósticos da fila.
 - Permite marcar uma pergunta como nome do contato e salvar o nome informado na agenda do WhatsApp.
 - Interrompe a automação em termos de urgência, comando de atendimento humano, falha repetida ou fim da triagem.
@@ -42,18 +42,18 @@ Na primeira execução, escaneie o QR exibido no terminal usando o WhatsApp do n
 
 O painel usa `http://127.0.0.1:3000` por padrão e grava as mudanças no arquivo de configuração sem reiniciar o processo. Em uma VM, mantenha a porta do painel fechada para a internet e acesse por túnel SSH, por exemplo `ssh -L 3000:127.0.0.1:3000 usuario@IP_DA_VM`; depois abra `http://localhost:3000` no navegador. A senha gerada na primeira inicialização fica em `data/panel-password` (ou defina uma senha própria, com pelo menos 12 caracteres, em `PANEL_PASSWORD`). Para publicar um endereço web, configure um domínio e HTTPS com o exemplo `deploy/Caddyfile.example`, mantendo o painel ligado apenas em `127.0.0.1`; não exponha a porta 3000 diretamente na internet.
 
-O painel permite configurar o estilo e limites de escrita, tópicos proibidos, memória institucional, materiais de texto, saudação, pergunta de área, cadência, simulação de digitação e limite de novos contatos. Os tempos ajustáveis são expressos em segundos. Cada fluxo admite perguntas abertas, sim/não, escolha única/múltipla, data e número, opções, orientação de estrutura e condições. A configuração ativa fica em `config/qualification.json`; cada gravação guarda uma cópia em `data/config-revisions`, mantendo as 20 versões mais recentes. Arquivos antigos com tempos em milissegundos são convertidos ao carregar, preservando a duração configurada.
+O painel permite configurar o estilo e limites de escrita, tópicos proibidos, memória institucional, materiais de texto, saudação, pergunta de área, cadência, simulação de digitação e limite de novos contatos. Na área de materiais, importe vários arquivos de uma vez: PDF, TXT, Markdown, CSV, JSON e DOCX; ZIP é aberto e os formatos compatíveis internos são importados como materiais separados. O limite é de 20 materiais e 20.000 caracteres no total. PDFs somente imagem não têm texto extraído e exigem OCR. Os tempos ajustáveis são expressos em segundos. Cada fluxo admite perguntas abertas, sim/não, escolha única/múltipla, data e número, opções, orientação de estrutura e condições. A configuração ativa fica em `config/qualification.json`; cada gravação guarda uma cópia em `data/config-revisions`, mantendo as 20 versões mais recentes. Arquivos antigos com tempos em milissegundos são convertidos ao carregar, preservando a duração configurada.
 
-### Contatos, etiquetas e importação
+### Contatos, listas e importação
 
-Use uma conta WhatsApp Business com etiquetas chamadas exatamente `BOT` e `HUMANO`. Um novo número que inicia conversa recebe `BOT`. `HUMANO` prevalece sobre `BOT`; remover as duas etiquetas pausa a automação. A atribuição também fica registrada no SQLite para que uma falha momentânea de sincronização não faça o bot atender sem autorização. Contatos antigos sem atribuição ficam pausados até receberem `BOT` pelo painel ou WhatsApp.
+O WhatsApp passou a chamar suas etiquetas de listas em algumas versões e a disponibilidade depende da conta e do aplicativo. Crie as listas `Novo Lead`, `Bot - atendimento` e `Atendimento`. Um contato sem atribuição entra primeiro em `Novo Lead`; depois o agente o move para `Bot - atendimento`. O agente só responde quando o banco local confirma essa lista. A lista `Atendimento` prevalece sobre `Bot - atendimento`; se nenhuma lista reconhecida estiver associada, o contato fica pausado. O painel sincroniza a atribuição com a sessão WhatsApp conectada e mantém uma cópia local para fila e diagnóstico. Se o Baileys não conseguir sincronizar as listas, consulte **Fila e diagnósticos** e o terminal; a sessão não é apagada automaticamente.
 
-Na página **Contatos e etiquetas**, altere a atribuição individual ou importe CSV com as colunas `telefone,atribuicao,nome`. `telefone` deve incluir DDI, e `atribuicao` deve ser `BOT` ou `HUMANO`. Exemplo:
+Na página **Contatos e etiquetas**, altere a lista individual ou importe CSV com as colunas `telefone,atribuicao,nome`. `telefone` deve incluir DDI; use `NOVO_LEAD`, `BOT` ou `HUMANO` na coluna de atribuição. Exemplo:
 
     telefone,atribuicao,nome
     +5511999999999,BOT,Ana Silva
 
-Na página **Fila e diagnósticos**, consulte eventos de entrada, processamento, resposta, pausa e falhas. Se o contato pedir uma pessoa ou houver uma sinalização de urgência, o atendimento recebe a etiqueta `HUMANO`.
+Na página **Fila e diagnósticos**, consulte eventos de entrada, processamento, resposta, pausa e falhas. Se o contato pedir uma pessoa ou houver uma sinalização de urgência, o atendimento é movido para a lista `Atendimento`.
 
 ## Configurar um fluxo
 
@@ -109,9 +109,9 @@ Para manter o processo após fechar o SSH, use o serviço de exemplo em deploy/w
 
 ## Limitações atuais
 
-- Os materiais são inseridos como texto no painel; documentos PDF/DOCX não são processados automaticamente.
+- PDFs digitalizados sem camada de texto exigem OCR, que não está incluído.
 - “Novo contato” significa contato sem histórico salvo pelo agente. O WhatsApp não informa a ele se o número era conhecido antes da instalação.
-- A sincronização de etiquetas depende do WhatsApp Business e do comportamento do protocolo não oficial do Baileys. O painel mantém a atribuição local como registro de segurança.
+- A sincronização de listas depende do WhatsApp Business, da disponibilidade do recurso na conta e do comportamento do protocolo não oficial do Baileys. O painel mantém a atribuição local como registro de segurança.
 - O número e as perguntas ainda precisam ser configurados pelo escritório.
 - A API gratuita não promete limite ou disponibilidade constantes.
 - Nenhum código deste repositório deve ser considerado aconselhamento jurídico automático. O agente faz triagem e encaminha; a análise e a orientação jurídica continuam com a equipe.
