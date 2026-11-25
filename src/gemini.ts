@@ -14,7 +14,7 @@ export interface ExtractionResult {
 }
 
 interface GeminiResponse {
-  candidates?: Array<{ content?: { parts?: Array<{ text?: unknown }> } }>;
+  candidates?: Array<{ finishReason?: string; content?: { parts?: Array<{ text?: unknown; thought?: boolean }> } }>;
   promptFeedback?: { blockReason?: string };
 }
 
@@ -56,8 +56,8 @@ export class GeminiProvider {
       ] }],
       generationConfig: { temperature: 0, maxOutputTokens: 4000 },
     }, 'transcrição', Math.min(Number.MAX_SAFE_INTEGER, timeoutSeconds * 1000));
-    const text = result.candidates?.[0]?.content?.parts?.map((part) => typeof part.text === 'string' ? part.text : '').join('').trim();
-    if (!text) throw new Error(`Gemini não retornou transcrição${result.promptFeedback?.blockReason ? ` (bloqueio: ${result.promptFeedback.blockReason})` : ''}.`);
+    const text = result.candidates?.[0]?.content?.parts?.filter((part) => !part.thought).map((part) => typeof part.text === 'string' ? part.text : '').join('').trim();
+    if (!text) throw new Error(`Gemini não retornou transcrição (bloqueio: ${result.promptFeedback?.blockReason ?? 'não informado'}; motivo: ${result.candidates?.[0]?.finishReason ?? 'sem candidato'}).`);
     return text;
   }
 
@@ -87,7 +87,8 @@ export class GeminiProvider {
       contents: [{ role: 'user', parts: [{ text: JSON.stringify({ perfil: profile.label, camposConfigurados: fields, valoresJaConfirmados: existingFields, conversaRecente: recent }) }] }],
       generationConfig: {
         temperature: 0.1,
-        maxOutputTokens: Math.min(1200, Math.ceil(assistant.maxCharsPerMessage / 3) + 80),
+        // Reserve espaço suficiente para serializar todos os campos e a confirmação.
+        maxOutputTokens: 2048,
         responseMimeType: 'application/json',
         responseJsonSchema: {
           type: 'object',
@@ -104,9 +105,10 @@ export class GeminiProvider {
         },
       },
     }, 'triagem');
-    const content = result.candidates?.[0]?.content?.parts?.map((part) => typeof part.text === 'string' ? part.text : '').join('').trim();
-    if (!content) throw new Error(`Gemini não retornou resposta${result.promptFeedback?.blockReason ? ` (bloqueio: ${result.promptFeedback.blockReason})` : ''}.`);
-    const decoded = parseJsonObject(content);
+    const candidate = result.candidates?.[0];
+    const content = candidate?.content?.parts?.filter((part) => !part.thought).map((part) => typeof part.text === 'string' ? part.text : '').join('').trim();
+    if (!content) throw new Error(`Gemini não retornou resposta (bloqueio: ${result.promptFeedback?.blockReason ?? 'não informado'}; motivo: ${candidate?.finishReason ?? 'sem candidato'}).`);
+    const decoded = parseJsonObject(content, candidate?.finishReason);
     const parsedResult = ExtractionSchema.safeParse(decoded);
     if (!parsedResult.success) {
       const issues = parsedResult.error.issues
@@ -123,7 +125,7 @@ export class GeminiProvider {
   }
 }
 
-function parseJsonObject(content: string): unknown {
+function parseJsonObject(content: string, finishReason?: string): unknown {
   const candidates = [content.trim()];
   const fenced = content.match(/```(?:json)?\s*([\s\S]*?)\s*```/i)?.[1];
   if (fenced) candidates.push(fenced.trim());
@@ -158,7 +160,7 @@ function parseJsonObject(content: string): unknown {
     try { return JSON.parse(candidate); }
     catch { /* Try the next candidate. */ }
   }
-  throw new Error('Gemini retornou conteúdo que não contém um objeto JSON válido.');
+  throw new Error(`Gemini retornou conteúdo fora do JSON esperado (motivo: ${finishReason ?? 'não informado'}; caracteres: ${content.length}).`);
 }
 function sanitizeAcknowledgement(value: string | undefined, maxCharacters: number, forbiddenTopics: string[]): string | null {
   if (!value) return null;
