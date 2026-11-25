@@ -10,8 +10,8 @@ Agente de atendimento inicial para WhatsApp, com painel visual, fluxos configur�
 - Persiste mensagens e tarefas em SQLite antes de processá-las.
 - Agrupa mensagens seguidas durante uma janela configurável.
 - Envia áudios PTT ao Gemini para transcrição em português e remove o arquivo temporário depois do processamento.
-- Usa a API Gemini para extrair respostas estruturadas e escrever uma confirmação breve.
-- Seleciona a próxima pergunta apenas a partir do fluxo configurado; o modelo não escolhe a pergunta nem fornece aconselhamento jurídico.
+- Usa a API Gemini para extrair respostas estruturadas e escrever uma confirmação breve; diante de uma pergunta direta, responde primeiro com informação geral concisa quando houver base segura.
+- Seleciona a próxima pergunta apenas a partir do fluxo configurado; o modelo não escolhe a pergunta, não analisa o caso individual nem recomenda medidas jurídicas.
 - Pode enviar confirmação e pergunta em mensagens separadas, com intervalo configurável.
 - Inclui painel web com senha, edição de fluxos e perguntas, instruções, materiais de apoio, prévia local e restauração da versão anterior.
 - Organiza contatos pelas listas do WhatsApp `Novo Lead`, `Bot - atendimento` e `Atendimento`. Um lead em `Novo Lead` é movido para `Bot - atendimento`, que dispara a saudação e a primeira pergunta; somente essa lista pode ser atendida pelo agente. `Atendimento` prevalece em caso de conflito.
@@ -42,7 +42,7 @@ Na primeira execução, escaneie o QR exibido no terminal usando o WhatsApp do n
 
 O painel usa `http://127.0.0.1:3000` por padrão e grava as mudanças no arquivo de configuração sem reiniciar o processo. Em uma VM, mantenha a porta do painel fechada para a internet e acesse por túnel SSH, por exemplo `ssh -L 3000:127.0.0.1:3000 usuario@IP_DA_VM`; depois abra `http://localhost:3000` no navegador. A senha gerada na primeira inicialização fica em `data/panel-password` (ou defina uma senha própria, com pelo menos 12 caracteres, em `PANEL_PASSWORD`). Para publicar um endereço web, configure um domínio e HTTPS com o exemplo `deploy/Caddyfile.example`, mantendo o painel ligado apenas em `127.0.0.1`; não exponha a porta 3000 diretamente na internet.
 
-O painel permite configurar o estilo e limites de escrita, tópicos proibidos, memória institucional, materiais de texto, saudação, pergunta de área, cadência, simulação de digitação e limite de novos contatos. Na área de materiais, importe vários arquivos de uma vez: PDF, TXT, Markdown, CSV, JSON e DOCX; ZIP é aberto e os formatos compatíveis internos são importados como materiais separados. O limite é de 20 materiais e 20.000 caracteres no total. PDFs somente imagem não têm texto extraído e exigem OCR. Os tempos ajustáveis são expressos em segundos. Cada fluxo admite perguntas abertas, sim/não, escolha única/múltipla, data e número, opções, orientação de estrutura e condições. A configuração ativa fica em `config/qualification.json`; cada gravação guarda uma cópia em `data/config-revisions`, mantendo as 20 versões mais recentes. Arquivos antigos com tempos em milissegundos são convertidos ao carregar, preservando a duração configurada.
+O painel permite configurar o estilo e limites de escrita, tópicos proibidos, memória institucional, materiais de texto, saudação, pergunta de área, cadência, simulação de digitação e limite de novos contatos. Em perguntas diretas, o Gemini pode explicar um conceito ou regra geral em uma ou duas frases, com base segura e sem aplicar a conclusão ao caso; não deve afirmar direitos individuais, prazos específicos, chances, resultados ou estratégias. A próxima pergunta de triagem continua sendo enviada pelo fluxo configurado, separadamente. Na área de materiais, importe vários arquivos de uma vez: PDF, TXT, Markdown, CSV, JSON e DOCX; ZIP é aberto e os formatos compatíveis internos são importados como materiais separados. O limite é de 20 materiais e 20.000 caracteres no total. PDFs somente imagem não têm texto extraído e exigem OCR. Os tempos ajustáveis são expressos em segundos. Cada fluxo admite perguntas abertas, sim/não, escolha única/múltipla, data e número, opções, orientação de estrutura e condições. A configuração ativa fica em `config/qualification.json`; cada gravação guarda uma cópia em `data/config-revisions`, mantendo as 20 versões mais recentes. Arquivos antigos com tempos em milissegundos são convertidos ao carregar, preservando a duração configurada.
 
 ### Contatos, listas e importação
 
@@ -115,7 +115,7 @@ Para manter o processo após fechar o SSH, use o serviço de exemplo em deploy/w
 - A sincronização de listas depende do WhatsApp Business, da disponibilidade do recurso na conta e do comportamento do protocolo não oficial do Baileys. O painel mantém a atribuição local como registro de segurança.
 - O número e as perguntas ainda precisam ser configurados pelo escritório.
 - A API gratuita não promete limite ou disponibilidade constantes.
-- Nenhum código deste repositório deve ser considerado aconselhamento jurídico automático. O agente faz triagem e encaminha; a análise e a orientação jurídica continuam com a equipe.
+- As explicações do agente são gerais e educativas, não aconselhamento jurídico individual. Ele faz triagem e encaminha; a análise e a orientação jurídica continuam com a equipe.
 ## Instalação
 
 O npm 12 bloqueia por padrão dependências Git. Como o Baileys 6.7.24 fixa `libsignal` no GitHub, use:
@@ -123,4 +123,3 @@ O npm 12 bloqueia por padrão dependências Git. Como o Baileys 6.7.24 fixa `lib
     npm install --allow-git=all
 
 Isso habilita dependências Git somente para esse comando, sem alterar a configuração global do npm. Se a instalação no Windows mostrar `EPERM` ao limpar `node_modules` dentro do OneDrive, feche processos Node/terminais que usem o projeto e, se persistir, clone o repositório fora da pasta sincronizada do OneDrive.
-

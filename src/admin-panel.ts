@@ -259,7 +259,11 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
         sendJson(response, 405, { error: 'Método não permitido.' });
         return;
       }
-      const relativePath = url.pathname === '/' ? 'index.html' : decodeURIComponent(url.pathname.slice(1));
+      const relativePath = url.pathname === '/'
+        ? 'index.html'
+        : url.pathname === '/favicon.ico'
+          ? 'favicon.svg'
+          : decodeURIComponent(url.pathname.slice(1));
       const filePath = resolve(publicDir, relativePath);
       if (!filePath.startsWith(publicDir + '\\') && !filePath.startsWith(publicDir + '/')) {
         sendJson(response, 403, { error: 'Acesso negado.' });
