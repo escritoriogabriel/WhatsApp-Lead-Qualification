@@ -4,7 +4,7 @@ import { pino } from 'pino';
 import { startAdminPanel } from './admin-panel.js';
 import { loadRuntimeConfig } from './config.js';
 import { AgentDatabase } from './database.js';
-import { GroqProvider } from './groq.js';
+import { GeminiProvider } from './gemini.js';
 import { QualificationWorker } from './qualification.js';
 import { connectWhatsApp, type WhatsAppConnection } from './whatsapp.js';
 
@@ -13,10 +13,8 @@ async function main(): Promise<void> {
   const logger = pino({ level: runtime.logLevel });
   await mkdir(runtime.mediaDir, { recursive: true, mode: 0o700 });
 
-  if (!runtime.apiKey) {
-    logger.warn(
-      'GROQ_API_KEY está vazio. O worker não conseguirá transcrever áudios nem qualificar mensagens.',
-    );
+  if (!runtime.geminiApiKey) {
+    logger.warn('GEMINI_API_KEY está vazio. O worker não conseguirá transcrever áudios nem qualificar mensagens.');
   }
   if (!runtime.humanNotifyJid) {
     logger.warn(
@@ -46,11 +44,7 @@ async function main(): Promise<void> {
     },
     logger,
   });
-  const provider = new GroqProvider(
-    runtime.apiKey,
-    runtime.chatModel,
-    runtime.transcriptionModel,
-  );
+  const provider = new GeminiProvider(runtime.geminiApiKey, runtime.geminiModel);
   const leadPromotions = new Set<string>();
   whatsapp = await connectWhatsApp(runtime, logger, async (message) => {
     if (!db.hasContact(message.jid)) {

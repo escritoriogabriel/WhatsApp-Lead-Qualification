@@ -74,9 +74,8 @@ export class ConfigValidationError extends Error {
 }
 
 export interface RuntimeConfig {
-  apiKey: string;
-  chatModel: string;
-  transcriptionModel: string;
+  geminiApiKey: string;
+  geminiModel: string;
   databasePath: string;
   authDir: string;
   mediaDir: string;
@@ -92,10 +91,8 @@ export function loadRuntimeConfig(): RuntimeConfig {
   const parsed = validateAssistantConfig(JSON.parse(readFileSync(qualificationPath, 'utf8')));
 
   return {
-    apiKey: process.env.GROQ_API_KEY ?? '',
-    chatModel: process.env.GROQ_CHAT_MODEL ?? 'openai/gpt-oss-20b',
-    transcriptionModel:
-      process.env.GROQ_TRANSCRIPTION_MODEL ?? 'whisper-large-v3-turbo',
+    geminiApiKey: process.env.GEMINI_API_KEY ?? '',
+    geminiModel: process.env.GEMINI_MODEL ?? 'gemini-3.5-flash',
     databasePath: process.env.DATABASE_PATH ?? 'data/agent.sqlite',
     authDir: process.env.AUTH_DIR ?? 'data/auth',
     mediaDir: process.env.MEDIA_DIR ?? 'data/tmp',

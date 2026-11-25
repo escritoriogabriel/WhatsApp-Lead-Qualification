@@ -8,7 +8,7 @@ import {
   type QueueJob,
   type StoredMessage,
 } from './database.js';
-import { GroqProvider } from './groq.js';
+import { GeminiProvider } from './gemini.js';
 
 const MAX_JOB_ATTEMPTS = 5;
 
@@ -24,7 +24,7 @@ export interface ContactManager {
 export class QualificationWorker {
   constructor(
     private readonly db: AgentDatabase,
-    private readonly provider: GroqProvider,
+    private readonly provider: GeminiProvider,
     private readonly getAssistant: () => AssistantConfig,
     private readonly runtime: RuntimeConfig,
     private readonly sendText: TextSender,

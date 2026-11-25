@@ -9,8 +9,8 @@ Agente de atendimento inicial para WhatsApp, com painel visual, fluxos configur�
 - Recebe mensagens privadas pelo evento messages.upsert do Baileys. Com esta integração, a entrada não é um webhook da API oficial.
 - Persiste mensagens e tarefas em SQLite antes de processá-las.
 - Agrupa mensagens seguidas durante uma janela configurável.
-- Baixa áudios PTT, transcreve em português com Groq Whisper e remove o arquivo temporário depois do processamento.
-- Usa um modelo de texto compatível com a API da Groq para extrair respostas e escrever uma breve confirmação.
+- Envia áudios PTT ao Gemini para transcrição em português e remove o arquivo temporário depois do processamento.
+- Usa a API Gemini para extrair respostas estruturadas e escrever uma confirmação breve.
 - Seleciona a próxima pergunta apenas a partir do fluxo configurado; o modelo não escolhe a pergunta nem fornece aconselhamento jurídico.
 - Pode enviar confirmação e pergunta em mensagens separadas, com intervalo configurável.
 - Inclui painel web com senha, edição de fluxos e perguntas, instruções, materiais de apoio, prévia local e restauração da versão anterior.
@@ -24,9 +24,9 @@ Agente de atendimento inicial para WhatsApp, com painel visual, fluxos configur�
 
 - Node.js 22 ou superior.
 - Um servidor Linux com armazenamento persistente para data/.
-- Uma chave de API Groq para transcrição e respostas. A cota gratuita e os modelos disponíveis dependem da conta e podem mudar.
+- Uma chave Gemini API. Modelos, cotas gratuitas e disponibilidade dependem do projeto Google AI Studio e podem mudar.
 
-O processamento de áudio usa o endpoint de transcrição da Groq. O arquivo é enviado ao provedor e apagado localmente depois; avalie a política de dados do provedor antes de usar conversas reais. O limite publicado para upload no nível gratuito é 25 MB por arquivo.
+O áudio é enviado à API Gemini como entrada multimodal para transcrição e apagado localmente após o processamento. Confira as condições de dados e os limites atuais do seu projeto Google AI Studio antes de usar conversas reais.
 
 ## Configuração local
 
@@ -34,7 +34,7 @@ O processamento de áudio usa o endpoint de transcrição da Groq. O arquivo é 
     Copy-Item .env.example .env
     Copy-Item config/qualification.example.json config/qualification.json
 
-Preencha GROQ_API_KEY em .env. No primeiro início, o painel cria uma senha aleatória em `data/panel-password`; consulte esse arquivo localmente para entrar. Também é possível definir `PANEL_PASSWORD` no `.env`. Não coloque credenciais nos fluxos ou materiais.
+Preencha `GEMINI_API_KEY` em `.env`; opcionalmente, configure `GEMINI_MODEL` (padrão `gemini-3.5-flash`). Não coloque a chave no código, nos fluxos ou nos materiais. No primeiro início, o painel cria uma senha aleatória em `data/panel-password`; consulte esse arquivo localmente para entrar. Também é possível definir `PANEL_PASSWORD` no `.env`.
 
     npm run dev
 
@@ -73,9 +73,8 @@ Se nenhum gatilho corresponder, o perfil marcado como default é usado. O agente
 
 | Variável | Finalidade |
 |---|---|
-| GROQ_API_KEY | Chave da API para transcrição e modelo de texto |
-| GROQ_CHAT_MODEL | Modelo de texto; o padrão é openai/gpt-oss-20b |
-| GROQ_TRANSCRIPTION_MODEL | Modelo Whisper; o padrão é whisper-large-v3-turbo |
+| GEMINI_API_KEY | Chave da API Gemini para texto e áudio |
+| GEMINI_MODEL | Modelo Gemini; padrão `gemini-3.5-flash` |
 | DATABASE_PATH | Banco SQLite; padrão data/agent.sqlite |
 | AUTH_DIR | Credenciais Baileys; padrão data/auth |
 | MEDIA_DIR | Áudios temporários; padrão data/tmp |
