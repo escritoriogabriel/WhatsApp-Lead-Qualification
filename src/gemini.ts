@@ -85,14 +85,36 @@ export class GeminiProvider {
     const result = await this.generate({
       systemInstruction: { parts: [{ text: systemPrompt }] },
       contents: [{ role: 'user', parts: [{ text: JSON.stringify({ perfil: profile.label, camposConfigurados: fields, valoresJaConfirmados: existingFields, conversaRecente: recent }) }] }],
-      generationConfig: { temperature: 0.1, maxOutputTokens: Math.min(1200, Math.ceil(assistant.maxCharsPerMessage / 3) + 80), responseMimeType: 'application/json' },
+      generationConfig: {
+        temperature: 0.1,
+        maxOutputTokens: Math.min(1200, Math.ceil(assistant.maxCharsPerMessage / 3) + 80),
+        responseMimeType: 'application/json',
+        responseJsonSchema: {
+          type: 'object',
+          properties: {
+            capturedFields: {
+              type: 'object',
+              properties: Object.fromEntries(profile.fields.map(({ id, label }) => [id, { type: 'string', description: label }])),
+              additionalProperties: false,
+            },
+            acknowledgement: { type: 'string' },
+          },
+          required: ['capturedFields', 'acknowledgement'],
+          additionalProperties: false,
+        },
+      },
     }, 'triagem');
     const content = result.candidates?.[0]?.content?.parts?.map((part) => typeof part.text === 'string' ? part.text : '').join('').trim();
     if (!content) throw new Error(`Gemini não retornou resposta${result.promptFeedback?.blockReason ? ` (bloqueio: ${result.promptFeedback.blockReason})` : ''}.`);
-    let decoded: unknown;
-    try { decoded = JSON.parse(content); }
-    catch { throw new Error('Gemini retornou JSON inválido.'); }
-    const parsed = ExtractionSchema.parse(decoded);
+    const decoded = parseJsonObject(content);
+    const parsedResult = ExtractionSchema.safeParse(decoded);
+    if (!parsedResult.success) {
+      const issues = parsedResult.error.issues
+        .map(({ path, message }) => `${path.join('.') || 'resposta'}: ${message}`)
+        .join('; ');
+      throw new Error(`Resposta do Gemini fora do formato esperado (${issues}).`);
+    }
+    const parsed = parsedResult.data;
     const allowedIds = new Set(profile.fields.map((field) => field.id));
     const capturedFields = Object.fromEntries(Object.entries(parsed.capturedFields)
       .filter(([id, value]) => allowedIds.has(id) && value.trim().length > 0)
@@ -101,6 +123,43 @@ export class GeminiProvider {
   }
 }
 
+function parseJsonObject(content: string): unknown {
+  const candidates = [content.trim()];
+  const fenced = content.match(/```(?:json)?\s*([\s\S]*?)\s*```/i)?.[1];
+  if (fenced) candidates.push(fenced.trim());
+
+  // Extract a balanced object if the model added a short preamble.
+  const start = content.indexOf('{');
+  if (start >= 0) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < content.length; index += 1) {
+      const character = content[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (character === '\\') escaped = true;
+        else if (character === '"') inString = false;
+        continue;
+      }
+      if (character === '"') inString = true;
+      else if (character === '{') depth += 1;
+      else if (character === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          candidates.push(content.slice(start, index + 1));
+          break;
+        }
+      }
+    }
+  }
+
+  for (const candidate of candidates) {
+    try { return JSON.parse(candidate); }
+    catch { /* Try the next candidate. */ }
+  }
+  throw new Error('Gemini retornou conteúdo que não contém um objeto JSON válido.');
+}
 function sanitizeAcknowledgement(value: string | undefined, maxCharacters: number, forbiddenTopics: string[]): string | null {
   if (!value) return null;
   const cleaned = value.replace(/[\r\n]+/g, ' ').trim();
