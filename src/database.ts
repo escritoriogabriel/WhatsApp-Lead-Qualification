@@ -514,6 +514,16 @@ export class AgentDatabase {
     return failed;
   }
 
+  deferJob(id: number, delayMs: number, reason: string): void {
+    const now = Date.now();
+    const safeDelay = Math.max(60_000, Math.min(delayMs, 7 * 24 * 60 * 60 * 1000));
+    this.db
+      .prepare(
+        "UPDATE jobs SET status = 'pending', attempts = 0, not_before = ?, last_error = ?, updated_at = ? WHERE id = ?",
+      )
+      .run(now + safeDelay, reason.slice(0, 300), now, id);
+  }
+
   close(): void {
     this.db.close();
   }

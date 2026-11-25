@@ -8,7 +8,7 @@ import {
   type QueueJob,
   type StoredMessage,
 } from './database.js';
-import { GeminiProvider } from './gemini.js';
+import { GeminiProvider, GeminiQuotaError } from './gemini.js';
 
 const MAX_JOB_ATTEMPTS = 5;
 
@@ -62,6 +62,13 @@ export class QualificationWorker {
       this.db.completeJob(job.id);
       this.db.recordDiagnostic(job.jid, 'processada', `Tarefa ${job.id} concluída`);
     } catch (error) {
+      if (error instanceof GeminiQuotaError) {
+        this.db.deferJob(job.id, error.retryAfterMs, error.message);
+        const resumesAt = new Date(Date.now() + error.retryAfterMs).toLocaleString('pt-BR');
+        this.db.recordDiagnostic(job.jid, 'aguardando-cota', `Cota gratuita do Gemini atingida; mensagem mantida na fila. Nova tentativa após ${resumesAt}.`);
+        this.logger.warn({ jid: job.jid, jobId: job.id, resumesAt }, 'Gemini quota reached; conversation job deferred');
+        return;
+      }
       const failure = safeError(error);
       const exhausted = this.db.retryJob(
         job.id,
@@ -229,11 +236,22 @@ export class QualificationWorker {
       return;
     }
 
-    const firstTurn =
+    const previousProfileId = state.profileId;
+    const profile = this.chooseProfile(userText, state);
+    const switchingProfile = previousProfileId !== null && previousProfileId !== profile.id;
+    if (switchingProfile) {
+      state.fields = {};
+      state.skippedFields = [];
+      state.attempts = {};
+      state.pendingFieldId = null;
+      state.completed = false;
+      state.paused = false;
+      this.db.recordDiagnostic(job.jid, 'fluxo-alterado', `Fluxo atualizado para ${profile.label} por indicação explícita na mensagem.`);
+    }
+    const firstTurn = !switchingProfile &&
       state.profileId === null &&
       state.pendingFieldId === null &&
       Object.keys(state.fields).length === 0;
-    const profile = this.chooseProfile(userText, state);
     state.profileId = profile.id;
     const extraction = await this.provider.extract(
       profile,
@@ -325,14 +343,15 @@ export class QualificationWorker {
     text: string,
     state: ConversationState,
   ): IntakeProfile {
-    const existing = this.assistant.profiles.find(
-      (profile) => profile.id === state.profileId,
-    );
-    if (existing) return existing;
     const normalized = normalize(text);
     const matched = this.assistant.profiles.find((profile) =>
       profile.triggers.some((trigger) => normalized.includes(normalize(trigger))),
     );
+    if (matched) return matched;
+    const existing = this.assistant.profiles.find(
+      (profile) => profile.id === state.profileId,
+    );
+    if (existing) return existing;
     return (
       matched ??
       this.assistant.profiles.find(
