@@ -57,7 +57,8 @@ export class QualificationWorker {
 
   private async processJob(job: QueueJob): Promise<void> {
     try {
-      await this.processConversation(job);
+      if (job.kind === 'start_conversation') await this.startConversation(job);
+      else await this.processConversation(job);
       this.db.completeJob(job.id);
       this.db.recordDiagnostic(job.jid, 'processada', `Tarefa ${job.id} concluída`);
     } catch (error) {
@@ -91,6 +92,44 @@ export class QualificationWorker {
         );
       }
     }
+  }
+
+  private async startConversation(job: QueueJob): Promise<void> {
+    if (this.db.getContactAssignment(job.jid) !== 'BOT') {
+      this.db.recordDiagnostic(job.jid, 'ignorada', 'Início cancelado: contato saiu da lista Bot - atendimento antes do envio');
+      return;
+    }
+    if (this.db.getUnprocessedMessages(job.jid).length > 0) {
+      this.db.recordDiagnostic(job.jid, 'ignorada', 'Início separado cancelado: há mensagem do contato aguardando processamento');
+      return;
+    }
+    const state = this.db.getConversationState(job.jid);
+    const profile = this.assistant.profiles.find((item) => item.id === state.profileId)
+      ?? this.assistant.profiles.find((item) => item.id === this.assistant.defaultProfileId);
+    if (!profile) throw new Error('Não há fluxo padrão disponível para iniciar a conversa.');
+    state.profileId = profile.id;
+    state.paused = false;
+    state.completed = false;
+
+    const nextPending = profile.fields.find((field) => field.id === state.pendingFieldId)
+      ?? profile.fields.find((field) => !state.fields[field.id] && !state.skippedFields.includes(field.id) && this.shouldAsk(field, state));
+    const firstTurn = this.db.getRecentMessages(job.jid, 1).length === 0 && Object.keys(state.fields).length === 0;
+    const areaUnknown = !state.fields[this.assistant.areaFieldId];
+    const pending = firstTurn && areaUnknown
+      ? profile.fields.find((field) => field.id === this.assistant.areaFieldId) ?? nextPending
+      : nextPending;
+    if (!pending) {
+      this.db.saveConversationState(job.jid, state);
+      this.db.recordDiagnostic(job.jid, 'ignorada', 'Início automático sem envio: não há pergunta pendente neste fluxo');
+      return;
+    }
+    state.pendingFieldId = pending.id;
+    this.db.saveConversationState(job.jid, state);
+    const parts = firstTurn
+      ? [this.assistant.greeting, areaUnknown ? this.assistant.areaQuestion : pending.question]
+      : [pending.question];
+    await this.deliver(job, job.jid, parts, 'qualification-start-' + pending.id);
+    this.db.recordDiagnostic(job.jid, 'processada', 'Saudação e primeira pergunta enviadas após entrada em Bot - atendimento');
   }
 
   private async processConversation(job: QueueJob): Promise<void> {

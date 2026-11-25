@@ -32,6 +32,7 @@ export interface ConversationState {
 export interface QueueJob {
   id: number;
   jid: string;
+  kind: string;
   attempts: number;
 }
 
@@ -206,13 +207,18 @@ export class AgentDatabase {
     return row?.id;
   }
 
-  saveLabel(id: string, name: string, color = 0, deleted = false): void {
+  saveLabel(id: string, name: string, color = 0, deleted = false): string[] {
     this.db.prepare(
       'INSERT INTO wa_labels (id, name, color, deleted) VALUES (?, ?, ?, ?) ' +
       'ON CONFLICT(id) DO UPDATE SET name = excluded.name, color = excluded.color, deleted = excluded.deleted',
     ).run(id, name, color, deleted ? 1 : 0);
     const affected = this.db.prepare('SELECT DISTINCT jid FROM contact_labels WHERE label_id = ?').all(id) as Array<{ jid: string }>;
-    for (const contact of affected) this.recalculateContactAssignment(contact.jid);
+    const newlyBotAssigned: string[] = [];
+    for (const contact of affected) {
+      const result = this.recalculateContactAssignment(contact.jid);
+      if (result.assignment === 'BOT' && result.previous !== 'BOT') newlyBotAssigned.push(contact.jid);
+    }
+    return newlyBotAssigned;
   }
 
   getLabelName(id: string): string | undefined {
@@ -235,7 +241,7 @@ export class AgentDatabase {
     this.recordDiagnostic(jid, 'etiqueta', `${add ? 'Adicionada' : 'Removida'}: ${name}`);
   }
 
-  private recalculateContactAssignment(jid: string): void {
+  private recalculateContactAssignment(jid: string): { previous: ContactAssignment | null; assignment: ContactAssignment } {
     const names = this.db.prepare(
       'SELECT upper(l.name) AS name FROM contact_labels cl JOIN wa_labels l ON l.id = cl.label_id ' +
       'WHERE cl.jid = ? AND l.deleted = 0',
@@ -248,6 +254,7 @@ export class AgentDatabase {
     this.db.prepare('UPDATE contacts SET assignment = ?, source = ?, updated_at = ? WHERE jid = ?')
       .run(assignment, 'whatsapp-label', Date.now(), jid);
     if (previous !== assignment) this.applyAssignmentToConversation(jid, assignment);
+    return { previous, assignment };
   }
 
   private applyAssignmentToConversation(jid: string, assignment: ContactAssignment): void {
@@ -255,9 +262,6 @@ export class AgentDatabase {
     if (assignment === 'BOT') {
       state.paused = false;
       state.completed = false;
-      state.pendingFieldId = null;
-      state.skippedFields = [];
-      state.attempts = {};
     } else {
       state.paused = true;
     }
@@ -287,6 +291,20 @@ export class AgentDatabase {
     if (Number(result.lastInsertRowid) % 100 === 0) {
       this.db.prepare('DELETE FROM diagnostics WHERE id <= ?').run(Number(result.lastInsertRowid) - 10_000);
     }
+  }
+
+  queueConversationStart(jid: string): boolean {
+    if (this.getContactAssignment(jid) !== 'BOT' || this.getUnprocessedMessages(jid).length > 0) return false;
+    const active = this.db.prepare(
+      "SELECT 1 FROM jobs WHERE jid = ? AND kind = 'start_conversation' AND status IN ('pending', 'processing') LIMIT 1",
+    ).get(jid);
+    if (active) return false;
+    const now = Date.now();
+    this.db.prepare(
+      "INSERT INTO jobs (jid, kind, status, not_before, created_at, updated_at) VALUES (?, 'start_conversation', 'pending', ?, ?, ?)",
+    ).run(jid, now, now, now);
+    this.recordDiagnostic(jid, 'na-fila', 'Contato entrou em Bot - atendimento; início automático da conversa');
+    return true;
   }
 
   listDiagnostics(limit = 200): DiagnosticRecord[] {
@@ -363,7 +381,7 @@ export class AgentDatabase {
     const transaction = this.db.transaction(() => {
       const job = this.db
         .prepare(
-          'SELECT id, jid, attempts FROM jobs ' +
+          'SELECT id, jid, kind, attempts FROM jobs ' +
             'WHERE status = ? AND not_before <= ? ' +
             'ORDER BY not_before, id LIMIT 1',
         )

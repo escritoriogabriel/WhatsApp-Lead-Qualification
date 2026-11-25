@@ -158,16 +158,21 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
             sendJson(response, 400, { error: 'Informe um telefone válido e a lista Novo Lead, Bot - atendimento ou Atendimento.' });
             return;
           }
-          const contactAssignment = assignment;
+          let contactAssignment = assignment;
           options.database.ensureContact(jid, 'PAUSADO', 'panel');
           try {
             await options.setContactAssignment(jid, contactAssignment);
+            if (contactAssignment === 'PAUSADO') {
+              await options.setContactAssignment(jid, 'BOT');
+              contactAssignment = 'BOT';
+            }
           } catch (error) {
             options.database.setContactAssignment(jid, 'PAUSADO', 'panel-list-sync-failed');
             options.database.recordDiagnostic(jid, 'falha-lista', error instanceof Error ? error.message : 'Falha ao sincronizar lista do WhatsApp.');
             throw error;
           }
-          options.database.setContactAssignment(jid, contactAssignment, 'panel');
+          options.database.setContactAssignment(jid, contactAssignment, contactAssignment === 'BOT' && assignment === 'PAUSADO' ? 'new-lead' : 'panel');
+          if (contactAssignment === 'BOT') options.database.queueConversationStart(jid);
           options.database.recordDiagnostic(jid, 'atribuicao', `Alterada no painel: ${contactAssignment}`);
           sendJson(response, 200, { ok: true, jid, assignment: contactAssignment });
           return;
@@ -188,11 +193,16 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
               continue;
             }
             try {
-              const contactAssignment = assignment;
+              let contactAssignment = assignment;
               options.database.ensureContact(jid, 'PAUSADO', 'csv-import');
               if (row.name) options.database.setContactName(jid, row.name.slice(0, 120));
               await options.setContactAssignment(jid, contactAssignment);
-              options.database.setContactAssignment(jid, contactAssignment, 'csv-import');
+              if (contactAssignment === 'PAUSADO') {
+                await options.setContactAssignment(jid, 'BOT');
+                contactAssignment = 'BOT';
+              }
+              options.database.setContactAssignment(jid, contactAssignment, assignment === 'PAUSADO' ? 'new-lead' : 'csv-import');
+              if (contactAssignment === 'BOT') options.database.queueConversationStart(jid);
               options.database.recordDiagnostic(jid, 'importacao', `CSV: ${contactAssignment}`);
               results.push({ phone: row.phone, assignment: row.assignment, ok: true });
             } catch (error) {

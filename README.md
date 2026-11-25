@@ -14,7 +14,7 @@ Agente de atendimento inicial para WhatsApp, com painel visual, fluxos configur�
 - Seleciona a próxima pergunta apenas a partir do fluxo configurado; o modelo não escolhe a pergunta nem fornece aconselhamento jurídico.
 - Pode enviar confirmação e pergunta em mensagens separadas, com intervalo configurável.
 - Inclui painel web com senha, edição de fluxos e perguntas, instruções, materiais de apoio, prévia local e restauração da versão anterior.
-- Organiza contatos pelas listas do WhatsApp `Novo Lead`, `Bot - atendimento` e `Atendimento`. Um novo contato entra em `Novo Lead` e, após a sincronização, é movido para `Bot - atendimento`; somente essa lista pode ser atendida pelo agente. `Atendimento` prevalece em caso de conflito.
+- Organiza contatos pelas listas do WhatsApp `Novo Lead`, `Bot - atendimento` e `Atendimento`. Um lead em `Novo Lead` é movido para `Bot - atendimento`, que dispara a saudação e a primeira pergunta; somente essa lista pode ser atendida pelo agente. `Atendimento` prevalece em caso de conflito.
 - Permite atribuir contatos pelo painel, importar uma lista CSV e consultar diagnósticos da fila.
 - Permite marcar uma pergunta como nome do contato e salvar o nome informado na agenda do WhatsApp.
 - Interrompe a automação em termos de urgência, comando de atendimento humano, falha repetida ou fim da triagem.
@@ -46,7 +46,9 @@ O painel permite configurar o estilo e limites de escrita, tópicos proibidos, m
 
 ### Contatos, listas e importação
 
-O WhatsApp passou a chamar suas etiquetas de listas em algumas versões e a disponibilidade depende da conta e do aplicativo. Crie as listas `Novo Lead`, `Bot - atendimento` e `Atendimento`. Um contato sem atribuição entra primeiro em `Novo Lead`; depois o agente o move para `Bot - atendimento`. O agente só responde quando o banco local confirma essa lista. A lista `Atendimento` prevalece sobre `Bot - atendimento`; se nenhuma lista reconhecida estiver associada, o contato fica pausado. O painel sincroniza a atribuição com a sessão WhatsApp conectada e mantém uma cópia local para fila e diagnóstico. Se o Baileys não conseguir sincronizar as listas, consulte **Fila e diagnósticos** e o terminal; a sessão não é apagada automaticamente.
+O WhatsApp passou a chamar suas etiquetas de listas em algumas versões e a disponibilidade depende da conta e do aplicativo. Crie as listas `Novo Lead`, `Bot - atendimento` e `Atendimento`. Quando um lead entra em `Novo Lead`, o agente o move para `Bot - atendimento` e inicia a conversa com a saudação e a pergunta configuradas. Também é possível mover um contato diretamente para `Bot - atendimento`; o worker colocará a abertura na fila. O agente só responde quando o banco local confirma essa lista. A lista `Atendimento` prevalece sobre `Bot - atendimento`; se nenhuma lista reconhecida estiver associada, o contato fica pausado. O painel sincroniza a atribuição com a sessão WhatsApp conectada e mantém uma cópia local para fila e diagnóstico.
+
+Se aparecer `App state key not present!` ou `failed to find key ... to decode mutation`, a sessão vinculada perdeu uma chave de sincronização e não consegue atualizar listas. Pare o agente, faça uma cópia da pasta `data/auth` (ou do caminho configurado em `AUTH_DIR`), remova esse dispositivo em **Aparelhos conectados** no WhatsApp e renomeie a pasta de autenticação antiga para um backup. Reinicie o agente e leia o novo QR. Não apague o banco `data/agent.sqlite`; ele contém contatos, conversas e fila. O agente registra o erro e não marca a atribuição como Bot quando a sincronização falha.
 
 Na página **Contatos e etiquetas**, altere a lista individual ou importe CSV com as colunas `telefone,atribuicao,nome`. `telefone` deve incluir DDI; use `NOVO_LEAD`, `BOT` ou `HUMANO` na coluna de atribuição. Exemplo:
 

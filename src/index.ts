@@ -51,6 +51,7 @@ async function main(): Promise<void> {
     runtime.chatModel,
     runtime.transcriptionModel,
   );
+  const leadPromotions = new Set<string>();
   whatsapp = await connectWhatsApp(runtime, logger, async (message) => {
     if (!db.hasContact(message.jid)) {
       db.ensureContact(message.jid, 'PAUSADO', 'new-lead');
@@ -79,10 +80,47 @@ async function main(): Promise<void> {
       'Mensagem recebida e colocada na fila',
     );
   },
-  (label) => db.saveLabel(label.id, label.name, label.color, label.deleted),
+  (label) => {
+    const newlyAssigned = db.saveLabel(label.id, label.name, label.color, label.deleted);
+    for (const jid of newlyAssigned) {
+      const queued = db.queueConversationStart(jid);
+      if (queued) logger.info({ jid, list: 'Bot - atendimento' }, 'Início automático colocado na fila após sincronizar a lista');
+    }
+  },
   (association, add) => {
+    if (association.chatId.endsWith('@g.us')) return;
     const name = db.getLabelName(association.labelId) ?? association.labelId;
+    const previousAssignment = db.getContactAssignment(association.chatId);
     db.updateContactLabel(association.chatId, association.labelId, name, add);
+    const currentAssignment = db.getContactAssignment(association.chatId);
+    if (currentAssignment === 'BOT' && (previousAssignment !== 'BOT' || db.getConversationState(association.chatId).profileId === null)) {
+      const queued = db.queueConversationStart(association.chatId);
+      if (queued) logger.info({ jid: association.chatId, list: 'Bot - atendimento' }, 'Início da conversa colocado na fila após mudança de lista');
+    }
+    if (add && name.trim().toLocaleLowerCase('pt-BR') === 'novo lead' && currentAssignment !== 'HUMANO' && !leadPromotions.has(association.chatId)) {
+      const activeWhatsApp = whatsapp;
+      if (!activeWhatsApp) {
+        db.recordDiagnostic(association.chatId, 'falha-lista', 'Lead está em Novo Lead, mas o WhatsApp ainda não terminou de conectar. Mova novamente para a lista quando a conexão estiver pronta.');
+        return;
+      }
+      leadPromotions.add(association.chatId);
+      void (async () => {
+        try {
+          await activeWhatsApp.setContactAssignment(association.chatId, 'BOT');
+          db.setContactAssignment(association.chatId, 'BOT', 'new-lead');
+          db.recordDiagnostic(association.chatId, 'lista', 'Movido automaticamente de Novo Lead para Bot - atendimento');
+          const queued = db.queueConversationStart(association.chatId);
+          if (queued) logger.info({ jid: association.chatId }, 'Novo lead promovido e início da conversa colocado na fila');
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          db.setContactAssignment(association.chatId, 'PAUSADO', 'new-lead-list-failed');
+          db.recordDiagnostic(association.chatId, 'falha-lista', `Não foi possível mover de Novo Lead para Bot - atendimento: ${detail}`);
+          logger.error({ jid: association.chatId, error: detail }, 'Falha ao promover lead da lista Novo Lead');
+        } finally {
+          leadPromotions.delete(association.chatId);
+        }
+      })();
+    }
   },
   (name) => db.getLabelIdByName(name));
 

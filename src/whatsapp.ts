@@ -40,8 +40,32 @@ export async function connectWhatsApp(
   let reconnectTimer: NodeJS.Timeout | undefined;
   let closing = false;
   let pairingRequired = false;
+  let hasAppStateSyncKey = false;
   const labelIds = new Map<string, string>();
   const labelCreations = new Map<string, Promise<string>>();
+  const localAssociationMutations = new Map<string, { count: number; timer: NodeJS.Timeout }>();
+  const associationKey = (jid: string, labelId: string, operation: string) => `${jid}\u0000${labelId}\u0000${operation}`;
+  const reserveLocalAssociation = (jid: string, labelId: string, operation: string): string => {
+    const key = associationKey(jid, labelId, operation);
+    const existing = localAssociationMutations.get(key);
+    if (existing) clearTimeout(existing.timer);
+    const entry = { count: (existing?.count ?? 0) + 1, timer: setTimeout(() => localAssociationMutations.delete(key), 10_000) };
+    entry.timer.unref();
+    localAssociationMutations.set(key, entry);
+    return key;
+  };
+  const releaseLocalAssociation = (key: string) => {
+    const entry = localAssociationMutations.get(key);
+    if (!entry) return;
+    clearTimeout(entry.timer);
+    if (entry.count <= 1) localAssociationMutations.delete(key);
+    else localAssociationMutations.set(key, { ...entry, count: entry.count - 1 });
+  };
+  const applyLocalAssociation = async (jid: string, labelId: string, operation: 'add' | 'remove', mutate: () => Promise<void>) => {
+    const key = reserveLocalAssociation(jid, labelId, operation);
+    try { await mutate(); }
+    catch (error) { releaseLocalAssociation(key); throw error; }
+  };
   const ensureLabel = async (jid: string, name: (typeof listNames)[number]): Promise<string> => {
     let id = labelIds.get(name) ?? getLabelId(name);
     if (id) return id;
@@ -65,6 +89,7 @@ export async function connectWhatsApp(
   const open = async (): Promise<void> => {
     if (closing || pairingRequired) return;
     const { state, saveCreds } = await useMultiFileAuthState(config.authDir);
+    hasAppStateSyncKey = Boolean(state.creds.myAppStateKeyId);
     const nextSocket = makeWASocket({
       auth: state,
       logger,
@@ -76,7 +101,10 @@ export async function connectWhatsApp(
     });
     socket = nextSocket;
 
-    nextSocket.ev.on('creds.update', saveCreds);
+    nextSocket.ev.on('creds.update', () => {
+      hasAppStateSyncKey = Boolean(state.creds.myAppStateKeyId);
+      void saveCreds();
+    });
     nextSocket.ev.on('labels.edit', (label) => {
       if (label.name) {
         const normalized = normalizeListName(label.name);
@@ -89,6 +117,10 @@ export async function connectWhatsApp(
     });
     nextSocket.ev.on('labels.association', ({ association, type }) => {
       if (association.type !== 'label_jid') return;
+      const operation = type === 'add' ? 'add' : 'remove';
+      const key = associationKey(association.chatId, association.labelId, operation);
+      const local = localAssociationMutations.get(key);
+      if (local) { releaseLocalAssociation(key); return; }
       onLabelAssociation(association, type === 'add');
     });
     nextSocket.ev.on('connection.update', (update) => {
@@ -99,6 +131,7 @@ export async function connectWhatsApp(
       }
       if (connection === 'open') {
         logger.info('WhatsApp conectado');
+        if (!hasAppStateSyncKey) logger.error('A sessão Baileys está sem myAppStateKeyId; alterações de listas não funcionarão. Faça backup de data/auth e pareie novamente o dispositivo vinculado.');
       }
       if (connection === 'close') {
         socket = null;
@@ -166,15 +199,16 @@ export async function connectWhatsApp(
     },
     async setContactAssignment(jid, assignment) {
       if (!socket) throw new Error('WhatsApp socket is not connected');
+      if (!hasAppStateSyncKey) throw new Error('Sessão Baileys sem chave de sincronização de estado (myAppStateKeyId). Faça backup de data/auth e pareie novamente o dispositivo vinculado no WhatsApp.');
       const target = assignment === 'BOT' ? 'Bot - atendimento' : assignment === 'HUMANO' ? 'Atendimento' : 'Novo Lead';
       const ids = await Promise.all(listNames.map((name) => ensureLabel(jid, name)));
       const targetId = ids[listNames.indexOf(target)];
-      for (const id of ids) if (id !== targetId) await socket.removeChatLabel(jid, id);
+      for (const id of ids) if (id !== targetId) await applyLocalAssociation(jid, id, 'remove', () => socket!.removeChatLabel(jid, id));
       for (const legacyName of ['BOT', 'HUMANO']) {
         const legacyId = getLabelId(legacyName);
-        if (legacyId) await socket.removeChatLabel(jid, legacyId);
+        if (legacyId) await applyLocalAssociation(jid, legacyId, 'remove', () => socket!.removeChatLabel(jid, legacyId));
       }
-      await socket.addChatLabel(jid, targetId!);
+      await applyLocalAssociation(jid, targetId!, 'add', () => socket!.addChatLabel(jid, targetId!));
     },
     async renameContact(jid, name) {
       if (!socket) throw new Error('WhatsApp socket is not connected');
