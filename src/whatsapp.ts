@@ -13,24 +13,43 @@ import type { Logger } from 'pino';
 import type { RuntimeConfig } from './config.js';
 import type { ContactAssignment, IncomingMessage } from './database.js';
 
+export interface WhatsAppLabel { id: string; name: string; color: number; deleted: boolean }
+export interface WhatsAppLabelAssociation { type: string; chatId: string; labelId: string }
+export interface WhatsAppStatus {
+  provider: 'baileys' | 'waha';
+  state: string;
+  connected: boolean;
+  session?: string;
+  engine?: string;
+  account?: string;
+}
+export interface WhatsAppCallbacks {
+  onIncoming: (message: IncomingMessage) => Promise<void> | void;
+  onLabelEdit: (label: WhatsAppLabel) => void;
+  onLabelAssociation: (association: WhatsAppLabelAssociation, add: boolean) => void;
+  getLabelId: (name: string) => string | undefined;
+}
+
 type MessageContent = NonNullable<WAMessage['message']>;
 const listNames = ['Novo Lead', 'Bot - atendimento', 'Atendimento'] as const;
-type Label = { id: string; name: string; color: number; deleted: boolean };
-type LabelAssociation = { type: string; chatId: string; labelId: string };
 
 export interface WhatsAppConnection {
   sendText(jid: string, text: string): Promise<void>;
   setContactAssignment(jid: string, assignment: ContactAssignment): Promise<void>;
   renameContact(jid: string, name: string): Promise<void>;
   close(): Promise<void>;
+  getStatus?(): Promise<WhatsAppStatus>;
+  getQrPng?(): Promise<Buffer | null>;
+  handleWebhook?(body: unknown): Promise<void>;
+  restart?(): Promise<void>;
 }
 
 export async function connectWhatsApp(
   config: RuntimeConfig,
   logger: Logger,
   onIncoming: (message: IncomingMessage) => Promise<void> | void,
-  onLabelEdit: (label: Label) => void,
-  onLabelAssociation: (association: LabelAssociation, add: boolean) => void,
+  onLabelEdit: (label: WhatsAppLabel) => void,
+  onLabelAssociation: (association: WhatsAppLabelAssociation, add: boolean) => void,
   getLabelId: (name: string) => string | undefined,
 ): Promise<WhatsAppConnection> {
   await mkdir(config.authDir, { recursive: true, mode: 0o700 });
@@ -40,6 +59,7 @@ export async function connectWhatsApp(
   let reconnectTimer: NodeJS.Timeout | undefined;
   let closing = false;
   let pairingRequired = false;
+  let connected = false;
   let hasAppStateSyncKey = false;
   const labelIds = new Map<string, string>();
   const labelCreations = new Map<string, Promise<string>>();
@@ -130,10 +150,12 @@ export async function connectWhatsApp(
         qrcode.generate(qr, { small: true });
       }
       if (connection === 'open') {
+        connected = true;
         logger.info('WhatsApp conectado');
         if (!hasAppStateSyncKey) logger.error('A sessão Baileys está sem myAppStateKeyId; alterações de listas não funcionarão. Faça backup de data/auth e pareie novamente o dispositivo vinculado.');
       }
       if (connection === 'close') {
+        connected = false;
         socket = null;
         const statusCode = (
           lastDisconnect?.error as
@@ -220,8 +242,12 @@ export async function connectWhatsApp(
         saveOnPrimaryAddressbook: true,
       });
     },
+    async getStatus() {
+      return { provider: 'baileys', state: connected ? 'WORKING' : pairingRequired ? 'FAILED' : 'DISCONNECTED', connected };
+    },
     async close() {
       closing = true;
+      connected = false;
       if (reconnectTimer) clearTimeout(reconnectTimer);
       socket?.end(undefined);
       socket = null;

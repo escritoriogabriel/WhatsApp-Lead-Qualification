@@ -8,3 +8,4 @@ body{background:radial-gradient(circle at 76% 0%,#eaf2ec 0,transparent 30%),#f5f
 @media(max-width:700px){.content{padding-top:26px}.error-summary{margin:12px 15px 0}.page-heading h1{font-size:29px}.topbar{backdrop-filter:none}.nav-extra{display:none}}
 
 .error-link{border:0;background:none;padding:0;color:#9f302c;text-decoration:underline;text-underline-offset:2px;font:inherit;font-weight:750;cursor:pointer}.import-errors{margin:12px 0 0}.control input[type=file]{padding:9px;background:#fbfcfb}
+.status-actions{display:flex;gap:8px;flex-wrap:wrap}.status-online{background:#e4f4e9;color:#24744e}.qr-wrap{display:grid;place-items:center;min-height:250px;padding:14px;background:#f7faf7;border:1px solid var(--line);border-radius:12px}.qr-wrap img{display:block;width:min(100%,320px);height:auto;image-rendering:pixelated}.qr-wrap:empty:after{content:"Aguardando QR…";color:var(--muted);font-size:11px}

@@ -6,7 +6,14 @@ import { loadRuntimeConfig } from './config.js';
 import { AgentDatabase } from './database.js';
 import { GeminiProvider } from './gemini.js';
 import { QualificationWorker } from './qualification.js';
-import { connectWhatsApp, type WhatsAppConnection } from './whatsapp.js';
+import { connectWaha } from './waha.js';
+import {
+  connectWhatsApp,
+  type WhatsAppCallbacks,
+  type WhatsAppConnection,
+  type WhatsAppLabelAssociation,
+  type WhatsAppStatus,
+} from './whatsapp.js';
 
 async function main(): Promise<void> {
   const runtime = loadRuntimeConfig();
@@ -27,26 +34,9 @@ async function main(): Promise<void> {
     runtime.assistant.batchWindowSeconds * 1000,
   );
   let whatsapp: WhatsAppConnection | null = null;
-  const closePanel = await startAdminPanel({
-    configPath: runtime.qualificationPath,
-    host: process.env.PANEL_HOST ?? '127.0.0.1',
-    port: Number(process.env.PANEL_PORT ?? 3000),
-    password: process.env.PANEL_PASSWORD ?? '',
-    getConfig: () => runtime.assistant,
-    setConfig: (assistant) => {
-      runtime.assistant = assistant;
-      db.setBatchWindowMs(assistant.batchWindowSeconds * 1000);
-    },
-    database: db,
-    setContactAssignment: async (jid, assignment) => {
-      if (!whatsapp) throw new Error('WhatsApp ainda está conectando. Tente novamente em instantes.');
-      await whatsapp.setContactAssignment(jid, assignment);
-    },
-    logger,
-  });
-  const provider = new GeminiProvider(runtime.geminiApiKey, runtime.geminiModel);
   const leadPromotions = new Set<string>();
-  whatsapp = await connectWhatsApp(runtime, logger, async (message) => {
+
+  const onIncoming: WhatsAppCallbacks['onIncoming'] = async (message) => {
     if (!db.hasContact(message.jid)) {
       db.ensureContact(message.jid, 'PAUSADO', 'new-lead');
     }
@@ -73,15 +63,17 @@ async function main(): Promise<void> {
       { jid: message.jid, kind: message.kind },
       'Mensagem recebida e colocada na fila',
     );
-  },
-  (label) => {
+  };
+
+  const onLabelEdit: WhatsAppCallbacks['onLabelEdit'] = (label) => {
     const newlyAssigned = db.saveLabel(label.id, label.name, label.color, label.deleted);
     for (const jid of newlyAssigned) {
       const queued = db.queueConversationStart(jid);
       if (queued) logger.info({ jid, list: 'Bot - atendimento' }, 'Início automático colocado na fila após sincronizar a lista');
     }
-  },
-  (association, add) => {
+  };
+
+  const onLabelAssociation: WhatsAppCallbacks['onLabelAssociation'] = (association: WhatsAppLabelAssociation, add) => {
     if (association.chatId.endsWith('@g.us')) return;
     const name = db.getLabelName(association.labelId) ?? association.labelId;
     const previousAssignment = db.getContactAssignment(association.chatId);
@@ -115,8 +107,53 @@ async function main(): Promise<void> {
         }
       })();
     }
-  },
-  (name) => db.getLabelIdByName(name));
+  };
+
+  const callbacks: WhatsAppCallbacks = {
+    onIncoming,
+    onLabelEdit,
+    onLabelAssociation,
+    getLabelId: (name) => db.getLabelIdByName(name),
+  };
+  const getWhatsAppStatus = async (): Promise<WhatsAppStatus> => {
+    if (whatsapp?.getStatus) return whatsapp.getStatus();
+    return { provider: runtime.whatsappProvider, state: 'INITIALIZING', connected: false };
+  };
+
+  const closePanel = await startAdminPanel({
+    configPath: runtime.qualificationPath,
+    host: process.env.PANEL_HOST ?? '127.0.0.1',
+    port: Number(process.env.PANEL_PORT ?? 3000),
+    password: process.env.PANEL_PASSWORD ?? '',
+    getConfig: () => runtime.assistant,
+    setConfig: (assistant) => {
+      runtime.assistant = assistant;
+      db.setBatchWindowMs(assistant.batchWindowSeconds * 1000);
+    },
+    database: db,
+    setContactAssignment: async (jid, assignment) => {
+      if (!whatsapp) throw new Error('WhatsApp ainda está conectando. Tente novamente em instantes.');
+      await whatsapp.setContactAssignment(jid, assignment);
+    },
+    getWhatsAppStatus,
+    getWhatsAppQr: async () => whatsapp?.getQrPng ? whatsapp.getQrPng() : null,
+    restartWhatsApp: async () => {
+      if (!whatsapp?.restart) throw new Error('Reinício da sessão não está disponível para este provedor.');
+      await whatsapp.restart();
+    },
+    handleWahaWebhook: async (body) => {
+      if (runtime.whatsappProvider !== 'waha' || !whatsapp?.handleWebhook) throw new Error('Provedor WAHA não está ativo.');
+      await whatsapp.handleWebhook(body);
+    },
+    ...(runtime.whatsappProvider === 'waha' ? { wahaWebhookSecret: runtime.wahaWebhookSecret } : {}),
+    logger,
+  });
+
+  const provider = new GeminiProvider(runtime.geminiApiKey, runtime.geminiModel);
+  whatsapp = runtime.whatsappProvider === 'waha'
+    ? await connectWaha(runtime, logger, callbacks)
+    : await connectWhatsApp(runtime, logger, callbacks.onIncoming, callbacks.onLabelEdit, callbacks.onLabelAssociation, callbacks.getLabelId);
+  logger.info({ whatsappProvider: runtime.whatsappProvider }, 'Provedor WhatsApp pronto');
 
   const abort = new AbortController();
   const worker = new QualificationWorker(

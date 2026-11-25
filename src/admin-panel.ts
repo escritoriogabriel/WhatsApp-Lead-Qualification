@@ -8,6 +8,7 @@ import type { Logger } from 'pino';
 import { z } from 'zod';
 import { ConfigValidationError, validateAssistantConfig, type AssistantConfig } from './config.js';
 import { AgentDatabase, type ContactAssignment } from './database.js';
+import type { WhatsAppStatus } from './whatsapp.js';
 
 interface PanelOptions {
   configPath: string;
@@ -19,6 +20,11 @@ interface PanelOptions {
   setConfig: (config: AssistantConfig) => void;
   database: AgentDatabase;
   setContactAssignment: (jid: string, assignment: ContactAssignment) => Promise<void>;
+  getWhatsAppStatus: () => Promise<WhatsAppStatus>;
+  getWhatsAppQr: () => Promise<Buffer | null>;
+  restartWhatsApp: () => Promise<void>;
+  handleWahaWebhook?: (body: unknown) => Promise<void>;
+  wahaWebhookSecret?: string;
   logger: Logger;
 }
 
@@ -38,6 +44,23 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
     addSecurityHeaders(response);
     try {
       const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
+      if (request.method === 'POST' && url.pathname === '/api/waha/webhook') {
+        const suppliedSecret = request.headers['x-waha-webhook-secret'];
+        if (!options.wahaWebhookSecret || !options.handleWahaWebhook || !safeEqual(Array.isArray(suppliedSecret) ? suppliedSecret[0] ?? '' : suppliedSecret ?? '', options.wahaWebhookSecret)) {
+          sendJson(response, 401, { error: 'Webhook não autorizado.' });
+          return;
+        }
+        const webhookBody = await readJson(request);
+        try {
+          await options.handleWahaWebhook(webhookBody);
+        } catch (error) {
+          options.logger.error({ error: error instanceof Error ? error.message : String(error) }, 'Falha ao processar webhook WAHA');
+          sendJson(response, 500, { error: 'Falha ao processar evento WAHA; a entrega pode ser repetida.' });
+          return;
+        }
+        sendJson(response, 200, { ok: true });
+        return;
+      }
       if (request.method === 'POST' && url.pathname === '/api/login') {
         const forwardedHeader = request.headers['x-forwarded-for'];
         const forwardedAddress = (Array.isArray(forwardedHeader) ? forwardedHeader[0] : forwardedHeader)
@@ -83,6 +106,31 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
       if (url.pathname.startsWith('/api/')) {
         if (!sessionToken(request, sessions)) {
           sendJson(response, 401, { error: 'Sessão encerrada. Entre novamente.' });
+          return;
+        }
+        if (request.method === 'GET' && url.pathname === '/api/whatsapp/status') {
+          sendJson(response, 200, await options.getWhatsAppStatus());
+          return;
+        }
+        if (request.method === 'GET' && url.pathname === '/api/whatsapp/qr') {
+          const qr = await options.getWhatsAppQr();
+          if (!qr) {
+            sendJson(response, 409, { error: 'QR não disponível. Atualize o estado da sessão e tente novamente.' });
+            return;
+          }
+          response.statusCode = 200;
+          response.setHeader('Content-Type', 'image/png');
+          response.setHeader('Cache-Control', 'no-store');
+          response.end(qr);
+          return;
+        }
+        if (request.method === 'POST' && url.pathname === '/api/whatsapp/restart') {
+          if (!sameOrigin(request)) {
+            sendJson(response, 403, { error: 'Origem da requisição inválida.' });
+            return;
+          }
+          await options.restartWhatsApp();
+          sendJson(response, 200, { ok: true });
           return;
         }
         if (request.method === 'GET' && url.pathname === '/api/config') {

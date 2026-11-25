@@ -2,11 +2,12 @@ const byId = (id) => document.getElementById(id);
 const app = byId('app');
 const login = byId('login');
 const content = byId('content');
-const TITLES = { overview:'Visão geral', behavior:'Comportamento', flow:'Fluxos e perguntas', messages:'Mensagens', knowledge:'Instruções e materiais', preview:'Testar conversa', contacts:'Contatos e listas', diagnostics:'Fila e diagnósticos' };
+const TITLES = { overview:'Visão geral', behavior:'Comportamento', flow:'Fluxos e perguntas', messages:'Mensagens', knowledge:'Instruções e materiais', preview:'Testar conversa', whatsapp:'Conexão WhatsApp', contacts:'Contatos e listas', diagnostics:'Fila e diagnósticos' };
 let config = null;
 let page = 'overview';
 let profileIndex = 0;
 let dirty = false;
+let whatsappPoller = null;
 
 async function api(path, options = {}) {
   const formData=typeof FormData!=='undefined'&&options.body instanceof FormData;
@@ -34,6 +35,7 @@ function markDirty() { dirty=true; byId('save-state').textContent='Alterações 
 function setPath(path,value) { const parts=path.split('.'); let target=config; for(const part of parts.slice(0,-1)){if(target[part]===undefined||target[part]===null)target[part]={};target=target[part];} target[parts.at(-1)]=value; markDirty(); }
 
 function render() {
+  if(whatsappPoller){clearInterval(whatsappPoller);whatsappPoller=null;}
   byId('page-title').textContent = TITLES[page];
   document.querySelectorAll('.nav-item').forEach((item)=>item.classList.toggle('active',item.dataset.page===page));
   if(page==='overview') renderOverview();
@@ -42,6 +44,7 @@ function render() {
   if(page==='messages') renderMessages();
   if(page==='knowledge') renderKnowledge();
   if(page==='preview') renderPreview();
+  if(page==='whatsapp') renderWhatsApp();
   if(page==='contacts') void renderContacts();
   if(page==='diagnostics') void renderDiagnostics();
   content.querySelectorAll('[data-path]').forEach((el)=>{
@@ -58,6 +61,52 @@ function render() {
   content.querySelectorAll('[data-list-path]').forEach((el)=>el.addEventListener('input',()=>{setPath(el.dataset.listPath,parseList(el.value));}));
   content.querySelectorAll('[data-action]').forEach((el)=>el.addEventListener('click',()=>action(el.dataset.action,el.dataset.index)));
   content.querySelectorAll('[data-contact-assignment]').forEach((el)=>el.addEventListener('change',()=>updateContact(el.dataset.jid,el.value)));
+}
+
+function renderWhatsApp() {
+  content.innerHTML=heading('OPERAÇÃO','Conexão WhatsApp','Acompanhe a sessão usada pelo agente, faça o pareamento e confira o mecanismo de integração.')+
+    `<div class="grid two"><div class="card"><div class="card-title-row"><h2>Estado da sessão</h2><span id="whatsapp-status-badge" class="pill">Consultando…</span></div><p id="whatsapp-status-detail" class="card-description">Consultando o provedor configurado…</p><div class="status-actions"><button class="button small" data-action="refresh-whatsapp">Atualizar estado</button><button id="whatsapp-restart" class="button small danger hidden" data-action="restart-whatsapp">Reiniciar sessão</button></div><div id="whatsapp-provider-help" class="notice">A leitura do status pode levar alguns segundos.</div></div><div id="whatsapp-qr-card" class="card hidden"><h2>Parear este número</h2><p class="card-description">No WhatsApp do número que será usado: <b>Aparelhos conectados → Conectar aparelho</b>. Escaneie o QR abaixo.</p><div id="whatsapp-qr-wrap" class="qr-wrap"><img id="whatsapp-qr" alt="QR de pareamento da sessão WhatsApp" /></div><p class="help">O QR é temporário e só é exibido para quem entrou no painel. Se expirar, atualize o estado para gerar outro.</p></div></div><div class="notice section-card">WAHA, assim como Baileys, conecta pelo protocolo do WhatsApp Web e não é a API oficial da Meta. Use um número de teste e considere o risco de desconexão ou restrição da conta.</div>`;
+  void refreshWhatsAppStatus();
+  whatsappPoller=setInterval(()=>void refreshWhatsAppStatus(),5000);
+}
+
+async function refreshWhatsAppStatus() {
+  const badge=byId('whatsapp-status-badge');
+  if(!badge)return;
+  try{
+    const status=await api('/api/whatsapp/status');
+    const state=String(status.state||'UNKNOWN').toUpperCase();
+    const provider=status.provider==='waha'?'WAHA':'Baileys';
+    const names={WORKING:'Conectado',SCAN_QR_CODE:'Aguardando leitura do QR',STARTING:'Iniciando',STOPPED:'Parado',FAILED:'Falha na sessão',DISCONNECTED:'Desconectado',INITIALIZING:'Inicializando'};
+    badge.textContent=names[state]||state;
+    badge.classList.toggle('status-online',Boolean(status.connected));
+    const details=[provider,status.session?`sessão ${status.session}`:'',status.engine?`mecanismo ${status.engine}`:'',status.account?`conta ${status.account}`:''].filter(Boolean).join(' · ');
+    byId('whatsapp-status-detail').textContent=details;
+    const help=byId('whatsapp-provider-help');
+    const restart=byId('whatsapp-restart');
+    const qrCard=byId('whatsapp-qr-card');
+    if(status.provider==='waha'&&state==='SCAN_QR_CODE'){
+      help.textContent='Abra o WhatsApp no celular, escolha Aparelhos conectados e leia o QR. Mantenha o painel aberto até o status mudar para Conectado.';
+      qrCard.classList.remove('hidden');
+      byId('whatsapp-qr').src=`/api/whatsapp/qr?t=${Date.now()}`;
+    }else{
+      qrCard.classList.add('hidden');
+      byId('whatsapp-qr').removeAttribute('src');
+      if(status.provider==='baileys')help.textContent='Baileys está ativo. O QR de primeiro pareamento é exibido no terminal que iniciou a aplicação.';
+      else if(state==='WORKING')help.textContent='A sessão está ativa. O agente pode receber mensagens, transcrever áudio e aplicar etiquetas conforme as instruções configuradas.';
+      else if(state==='FAILED'||state==='STOPPED')help.textContent='A sessão não está ativa. Consulte os logs do WAHA e, se necessário, reinicie a sessão.';
+      else help.textContent='A sessão ainda está iniciando ou reconectando. O painel atualizará este estado automaticamente.';
+    }
+    restart.classList.toggle('hidden',status.provider!=='waha'||!['FAILED','STOPPED'].includes(state));
+  }catch(error){
+    badge.textContent='Indisponível';
+    badge.classList.remove('status-online');
+    byId('whatsapp-status-detail').textContent=error.message;
+    byId('whatsapp-provider-help').textContent='Não foi possível consultar o provedor. Verifique se o serviço WAHA está ativo e se a chave da API está correta.';
+    byId('whatsapp-qr-card').classList.add('hidden');
+    byId('whatsapp-restart').classList.add('hidden');
+    byId('whatsapp-qr').removeAttribute('src');
+  }
 }
 
 function renderOverview() {
@@ -237,6 +286,8 @@ function action(name,indexValue) {
   const index=Number(indexValue);
   const profile=config.profiles[profileIndex];
   if(name==='goto-behavior'){page='behavior';render();return;}
+  if(name==='refresh-whatsapp'){void refreshWhatsAppStatus();return;}
+  if(name==='restart-whatsapp'){void restartWhatsApp();return;}
   if(name==='import-contacts'){void importContacts();return;}
   if(name==='import-materials'){void importMaterials();return;}
   if(name==='refresh-contacts'){void renderContacts();return;}
@@ -249,6 +300,17 @@ function action(name,indexValue) {
   if(name==='down-field'&&index<profile.fields.length-1){[profile.fields[index+1],profile.fields[index]]=[profile.fields[index],profile.fields[index+1]];markDirty();renderFlow();return;}
   if(name==='add-material'){config.materials=config.materials||[];config.materials.push({title:'Novo material',content:''});markDirty();render();return;}
   if(name==='remove-material'){config.materials.splice(index,1);markDirty();render();}
+}
+
+async function restartWhatsApp() {
+  const button=byId('whatsapp-restart');
+  if(button)button.disabled=true;
+  try{
+    await api('/api/whatsapp/restart',{method:'POST',body:'{}'});
+    toast('Solicitação de reinício enviada.');
+    await refreshWhatsAppStatus();
+  }catch(error){toast(error.message,true);}
+  finally{if(button)button.disabled=false;}
 }
 
 async function importMaterials() {

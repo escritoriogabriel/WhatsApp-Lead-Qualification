@@ -76,6 +76,12 @@ export class ConfigValidationError extends Error {
 export interface RuntimeConfig {
   geminiApiKey: string;
   geminiModel: string;
+  whatsappProvider: 'baileys' | 'waha';
+  wahaApiUrl: string;
+  wahaApiKey: string;
+  wahaSession: string;
+  wahaWebhookUrl: string;
+  wahaWebhookSecret: string;
   databasePath: string;
   authDir: string;
   mediaDir: string;
@@ -89,10 +95,25 @@ export function loadRuntimeConfig(): RuntimeConfig {
   const qualificationPath =
     process.env.CONFIG_PATH ?? 'config/qualification.json';
   const parsed = validateAssistantConfig(JSON.parse(readFileSync(qualificationPath, 'utf8')));
+  const configuredProvider = (process.env.WHATSAPP_PROVIDER ?? 'baileys').trim().toLowerCase();
+  if (configuredProvider !== 'baileys' && configuredProvider !== 'waha') {
+    throw new Error('WHATSAPP_PROVIDER deve ser "baileys" ou "waha".');
+  }
+  const wahaApiKey = process.env.WAHA_API_KEY ?? '';
+  const wahaWebhookSecret = process.env.WAHA_WEBHOOK_SECRET ?? '';
+  if (configuredProvider === 'waha' && (!wahaApiKey || !wahaWebhookSecret)) {
+    throw new Error('WAHA_API_KEY e WAHA_WEBHOOK_SECRET são obrigatórios quando WHATSAPP_PROVIDER=waha.');
+  }
 
   return {
     geminiApiKey: process.env.GEMINI_API_KEY ?? '',
     geminiModel: process.env.GEMINI_MODEL ?? 'gemini-3.5-flash',
+    whatsappProvider: configuredProvider,
+    wahaApiUrl: (process.env.WAHA_API_URL ?? 'http://localhost:3001').replace(/\/+$/, ''),
+    wahaApiKey,
+    wahaSession: process.env.WAHA_SESSION ?? 'triagem',
+    wahaWebhookUrl: process.env.WAHA_WEBHOOK_URL ?? 'http://localhost:3000/api/waha/webhook',
+    wahaWebhookSecret,
     databasePath: process.env.DATABASE_PATH ?? 'data/agent.sqlite',
     authDir: process.env.AUTH_DIR ?? 'data/auth',
     mediaDir: process.env.MEDIA_DIR ?? 'data/tmp',

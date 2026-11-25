@@ -1,0 +1,38 @@
+services:
+  waha:
+    image: ${WAHA_IMAGE:-devlikeapro/waha:gows}
+    restart: unless-stopped
+    environment:
+      WHATSAPP_DEFAULT_ENGINE: GOWS
+      WAHA_API_KEY: ${WAHA_API_KEY:?Defina WAHA_API_KEY no arquivo .env}
+      WAHA_DASHBOARD_USERNAME: ${WAHA_DASHBOARD_USERNAME:-admin}
+      WAHA_DASHBOARD_PASSWORD: ${WAHA_DASHBOARD_PASSWORD:?Defina WAHA_DASHBOARD_PASSWORD no arquivo .env}
+    ports:
+      - "127.0.0.1:3001:3000"
+    volumes:
+      - waha_sessions:/app/.sessions
+
+  app:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      WHATSAPP_PROVIDER: waha
+      PANEL_HOST: 0.0.0.0
+      PANEL_PORT: 3000
+      WAHA_API_URL: http://waha:3000
+      WAHA_WEBHOOK_URL: http://app:3000/api/waha/webhook
+      WAHA_API_KEY: ${WAHA_API_KEY:?Defina WAHA_API_KEY no arquivo .env}
+      WAHA_WEBHOOK_SECRET: ${WAHA_WEBHOOK_SECRET:?Defina WAHA_WEBHOOK_SECRET no arquivo .env}
+    depends_on:
+      - waha
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+
+volumes:
+  waha_sessions:
