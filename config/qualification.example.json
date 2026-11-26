@@ -1,4 +1,5 @@
 {
+  "whatsappProvider": "openwa",
   "aiProvider": "gemini",
   "audioTranscriptionProvider": "disabled",
   "officeName": "Escritório",
@@ -9,13 +10,26 @@
   "materials": [],
   "conversationStyleSamples": [],
   "conversationInstructions": "Use os exemplos somente para aprender o tom, a forma de acolher e a organização das respostas. Nunca copie dados de clientes.",
-  "responseTemplates": {
-    "greeting": "Olá! Vou fazer algumas perguntas iniciais para encaminhar seu atendimento.",
-    "directQuestion": "Para orientar o encaminhamento, preciso primeiro concluir algumas perguntas objetivas.",
-    "acknowledgement": "Obrigado. Vou seguir com a próxima pergunta.",
-    "humanHandoff": "Vou encaminhar seu atendimento para a equipe do escritório.",
-    "completion": "Obrigado pelas informações. Vou encaminhar o resumo para a equipe do escritório."
-  },
+  "conditionalEvents": [
+    {
+      "id": "evento-documentos",
+      "name": "Pedido de documentos",
+      "trigger": "keyword",
+      "keywords": ["documento", "documentos"],
+      "action": "send_message",
+      "message": "Nesta etapa não é necessário enviar documentos. A equipe vai solicitar o que for preciso.",
+      "enabled": true
+    },
+    {
+      "id": "evento-urgencia",
+      "name": "Orientação em urgência",
+      "trigger": "urgent",
+      "keywords": [],
+      "action": "send_message",
+      "message": "Se houver risco imediato, ligue 190 ou procure o serviço de emergência.",
+      "enabled": true
+    }
+  ],
   "conditionalEvents": [],
   "greeting": "Olá! Vou fazer algumas perguntas iniciais para encaminhar seu atendimento.",
   "assistantNotice": "Sou assistente virtual do escritório e faço somente a triagem inicial. Não sou advogado.",

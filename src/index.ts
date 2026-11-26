@@ -8,6 +8,7 @@ import { RoutedAIProvider } from './ai-router.js';
 import { connectMetaCloudApi } from './meta.js';
 import { ensureNewLeadLists } from './lead-labels.js';
 import { QualificationWorker, type ContactManager } from './qualification.js';
+import { connectOpenwa } from './openwa.js';
 import { connectWaha } from './waha.js';
 import {
   connectWhatsApp,
@@ -121,15 +122,19 @@ async function main(): Promise<void> {
     onLabelsReady: initializePendingLeads,
   };
   const openWhatsAppProvider = async (provider: RuntimeConfig['whatsappProvider']): Promise<WhatsAppConnection> => {
+    if (provider === 'openwa') return connectOpenwa(runtime, logger, callbacks);
     if (provider === 'waha') return connectWaha(runtime, logger, callbacks);
-    if (provider === 'meta') throw new Error('Meta Cloud API não expõe as listas nativas exigidas por esta operação. Selecione WAHA ou Baileys.');
+    if (provider === 'meta') throw new Error('Meta Cloud API não expõe as listas nativas exigidas por esta operação. Selecione OpenWA, WAHA ou Baileys.');
     return connectWhatsApp(runtime, logger, callbacks.onIncoming, callbacks.onLabelEdit, callbacks.onLabelAssociation, callbacks.getLabelId, callbacks.getContactLabelNames, callbacks.onLabelsReady);
   };
   const ensureProviderCredentials = (provider: RuntimeConfig['whatsappProvider']): void => {
     if (provider === 'waha' && (!runtime.wahaApiKey || !runtime.wahaWebhookSecret)) {
       throw new Error('WAHA_API_KEY e WAHA_WEBHOOK_SECRET são obrigatórios para usar WAHA.');
     }
-    if (provider === 'meta') throw new Error('Meta Cloud API não oferece sincronização com as listas nativas deste fluxo. Use WAHA ou Baileys.');
+    if (provider === 'openwa' && (!runtime.openwaApiKey || !runtime.openwaWebhookSecret)) {
+      throw new Error('OPENWA_API_KEY e OPENWA_WEBHOOK_SECRET são obrigatórios para usar OpenWA.');
+    }
+    if (provider === 'meta') throw new Error('Meta Cloud API não oferece sincronização com as listas nativas deste fluxo. Use OpenWA, WAHA ou Baileys.');
   };
   const changeWhatsAppProvider = async (provider: RuntimeConfig['whatsappProvider']): Promise<void> => {
     ensureProviderCredentials(provider);
@@ -190,6 +195,11 @@ async function main(): Promise<void> {
       await whatsapp.handleWebhook(body);
     },
     wahaWebhookSecret: runtime.wahaWebhookSecret,
+    handleOpenwaWebhook: async (body) => {
+      if (runtime.whatsappProvider !== 'openwa' || !whatsapp?.handleWebhook) return;
+      await whatsapp.handleWebhook(body);
+    },
+    openwaWebhookSecret: runtime.openwaWebhookSecret,
     metaAppSecret: runtime.metaAppSecret,
     metaWebhookVerifyToken: runtime.metaWebhookVerifyToken,
     logger,

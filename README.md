@@ -6,7 +6,7 @@ O modelo de IA **não redige mensagens ao contato**, não escolhe quem pode rece
 
 ## Estado do projeto
 
-Esta versão usa WAHA ou Baileys, uma fila persistente e as listas nativas do WhatsApp para autorizar respostas. A Meta Cloud API é recusada porque o adaptador atual não sincroniza essas listas. A aplicação ainda exige configuração e validação em ambiente controlado antes de qualquer uso com dados reais. Não oferece garantia de envio único ou disponibilidade contínua.
+Esta versão usa OpenWA, WAHA ou Baileys, uma fila persistente e as listas nativas do WhatsApp para autorizar respostas. O OpenWA é a integração recomendada: ele concentra a sessão, o envio, o recebimento e os webhooks, enquanto esta aplicação continua responsável pela autorização, pelas regras de negócio, pela fila e pela auditoria. A Meta Cloud API é recusada porque o adaptador atual não sincroniza essas listas. A aplicação ainda exige configuração e validação em ambiente controlado antes de qualquer uso com dados reais. Não oferece garantia de envio único ou disponibilidade contínua.
 
 ## Como funciona a triagem
 
@@ -24,6 +24,7 @@ Se a configuração usar Gemini, o primeiro conteúdo da conversa **não é envi
 | Provedor | Uso previsto | Autorização | Limitações relevantes |
 |---|---|---|---|
 | **Meta Cloud API** | Indisponível neste fluxo | — | Não sincroniza as listas nativas usadas para autorizar o bot. A aplicação recusa essa seleção. |
+| **OpenWA** | Integração recomendada | Etiquetas/listas lidas antes de cada envio (mecanismo `whatsapp-web.js`) | Gateway self-hosted com API REST, webhooks assinados por HMAC e plugins. Exige etiquetas criadas previamente no WhatsApp Business. Detalhes, versão fixada e runbook em [`docs/openwa.md`](docs/openwa.md). |
 | **WAHA / GOWS** | Teste e operação local | Etiquetas/listas do WhatsApp, conferidas antes de cada envio | Usa sessão do WhatsApp Web. Não oferece a mesma garantia operacional da API oficial. Eventos e APIs de etiquetas são documentados pelo [WAHA](https://waha.devlike.pro/docs/how-to/labels/), [eventos](https://waha.devlike.pro/docs/how-to/events/) e [mecanismos](https://waha.devlike.pro/docs/how-to/engines/). |
 | **Baileys** | Compatibilidade legada | Etiquetas sincronizadas pela sessão | Também usa o protocolo do WhatsApp Web e depende da sincronização da sessão. Não é a integração indicada para produção. |
 
@@ -46,8 +47,8 @@ O `.env.example` seleciona Gemini 3.5 Flash-Lite e exige uma chave válida do Go
 Requisitos: Docker Compose, Node.js 22+ para desenvolvimento e espaço protegido para o SQLite e a sessão WhatsApp.
 
 1. Copie `.env.example` para `.env` e `config/qualification.example.json` para `config/qualification.json`.
-2. Substitua os marcadores de WAHA por segredos aleatórios diferentes. Não use os valores de exemplo em operação real. Não compartilhe `.env`, `data/`, `data/auth/` ou o volume de sessão.
-3. Inicie o app e o WAHA:
+2. Substitua os marcadores de OpenWA e WAHA por segredos aleatórios diferentes. Não use os valores de exemplo em operação real. Não compartilhe `.env`, `data/`, `data/auth/` ou o volume de sessão.
+3. Inicie o app, o OpenWA e o WAHA:
 
    ```sh
    docker compose up -d --build
@@ -56,22 +57,27 @@ Requisitos: Docker Compose, Node.js 22+ para desenvolvimento e espaço protegido
 4. Acesse o painel em `http://localhost:3000`. As portas do Compose ficam vinculadas ao loopback. A senha aleatória do painel é gravada em `data/panel-password`, a menos que `PANEL_PASSWORD` esteja definida.
 5. Na página **Conexão WhatsApp**, confira o status e leia o QR somente quando decidir conectar um número de teste. Não use um número de cliente.
 
-Para Ollama em host Docker, o Compose usa `host.docker.internal:11434` por padrão; configure `OLLAMA_API_URL_DOCKER` se o serviço estiver em outro endereço. O Compose sobe WAHA mesmo que Baileys esteja selecionado.
+Para Ollama em host Docker, o Compose usa `host.docker.internal:11434` por padrão; configure `OLLAMA_API_URL_DOCKER` se o serviço estiver em outro endereço. O Compose sobe OpenWA e WAHA independentemente do provedor selecionado.
 
-O processo pode ser executado diretamente com Node.js. Selecione WAHA ou Baileys. Para webhooks WAHA, o provedor também precisa alcançar `/api/waha/webhook`. Não exponha o painel sem HTTPS e senha forte.
+O OpenWA sobe em `http://127.0.0.1:2785` (API em `/api`, painel próprio no navegador). A chave do gateway fica no `.env` e só o backend a usa. O serviço do Compose desativa o filtro SSRF de webhook (`WEBHOOK_SSRF_PROTECT=false`) para que o gateway alcance o host interno `app`; fora dessa rede, registre um webhook público HTTPS. Para criar a sessão e parear o número de teste, leia [`docs/openwa.md`](docs/openwa.md).
+
+O processo pode ser executado diretamente com Node.js. Selecione OpenWA, WAHA ou Baileys. Para webhooks, o provedor precisa alcançar `/api/openwa/webhook` ou `/api/waha/webhook`. Não exponha o painel sem HTTPS e senha forte.
 
 No primeiro início, o painel pode gerar uma senha em `data/panel-password`. Em VPS, prefira túnel SSH ou proxy HTTPS e mantenha as portas administrativas fechadas para a internet. Faça backups protegidos de `data/`, do volume `waha_sessions` e do arquivo de configuração. O banco guarda conversas, contatos, estado da triagem e fila; os backups são dados pessoais.
 
 ## Configurações do painel
 
-O painel configura:
+O painel é organizado em páginas:
 
-- provedor WhatsApp, provedor de IA e transcrição de áudio;
-- perfis, campos, perguntas, tipos de resposta, opções e condições;
-- textos de abertura, aviso virtual, privacidade, aviso externo, esclarecimento, urgência, conclusão e encaminhamento;
-- termos configuráveis de urgência, pedido de atendimento humano, perguntas jurídicas e temas que devem ir à equipe;
-- tamanho e quantidade de balões, agrupamento de mensagens, atraso, presença de digitação e limites por contato e globais;
-- retenção, revisão e restauração de configuração.
+- **Visão geral** — resumo do fluxo padrão, provedor de IA e atalho para aplicar o modelo de escritório;
+- **Mensagens padrão** — identificação do escritório, abertura (com cumprimentos prontos), avisos de assistente, privacidade e processamento externo, confirmação, esclarecimento, conclusão, encaminhamento, urgência, falha da IA e áudio, além do ritmo de envio;
+- **Fluxos e perguntas** — áreas, palavras-gatilho, perguntas, tipos de resposta, opções, condições e obrigatoriedade;
+- **Eventos e condições** — eventos da conversa por palavra-chave, primeira mensagem, áudio, urgência detectada, pedido de atendimento humano ou conclusão da triagem, com ações de enviar mensagem, avisar a equipe ou pausar; e as listas de termos de urgência, perguntas jurídicas e temas reservados;
+- **Estilo e materiais** — tom de voz, contexto do escritório, importação de TXT/MD de conversas para a IA aprender o jeito de falar (até 10 exemplos e 30.000 caracteres) e materiais internos em PDF, TXT, MD, CSV, JSON, DOCX ou ZIP;
+- **Testar conversa** — simulação por turnos das mensagens, eventos, condições e limites de balão, sem enviar nada e sem chamar modelo;
+- **Conexão WhatsApp**, **Regras das listas** e **Fila e diagnósticos** — operação da sessão, autorização por etiquetas e histórico técnico.
+
+A presença de digitação é limitada a 8 segundos por balão e `typingSecondsPerCharacter` não pode passar de 1: o atraso é apenas cosmético e nunca deve segurar o atendimento. O painel também restaura a última versão salva e mantém até 20 revisões da configuração.
 
 As listas são `Novo Lead`, `Bot - atendimento`, `Clientes` e `Atendimento`. `Clientes` bloqueia o bot; `Atendimento` não autoriza respostas. `Novo Lead` e `Bot - atendimento` coexistem.
 
@@ -110,3 +116,5 @@ Para comparar extração com exemplos sintéticos, instale os modelos locais `qw
 - Transcrição local de áudio e janela de atendimento/expediente ainda não estão implementadas.
 - Eventos repetidos são deduplicados e envios incertos são pausados, mas não há garantia de entrega exatamente uma vez entre SQLite e API externa.
 - Etiquetas do WhatsApp Web podem perder sincronização ou ficar indisponíveis. Em caso de dúvida, o agente deve permanecer pausado até revisão.
+- No OpenWA, a leitura de etiquetas existe apenas no mecanismo `whatsapp-web.js`, e a criação/edição de etiquetas apenas no `baileys`. Como a autorização depende da leitura, o OpenWA deve rodar com `whatsapp-web.js` e as quatro etiquetas (`Novo Lead`, `Bot - atendimento`, `Atendimento`, `Clientes`) precisam ser criadas antes no aplicativo WhatsApp Business. O gateway também não emite eventos de alteração de etiqueta: remoções são percebidas na próxima mensagem ou na nova tentativa do trabalho pendente.
+- O OpenWA não permite idempotência por mensagem nesta integração, pois o adaptador não recebe o identificador da saída antes do envio. Resultado de envio incerto continua pausado para revisão e não é reenviado automaticamente.

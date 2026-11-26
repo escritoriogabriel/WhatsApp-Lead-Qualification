@@ -18,7 +18,7 @@ export interface WhatsAppLabel { id: string; name: string; color: number; delete
 export interface WhatsAppLabelAssociation { type: string; chatId: string; labelId: string }
 export type WhatsAppLabelTarget = 'BOT' | 'HUMANO';
 export interface WhatsAppStatus {
-  provider: 'baileys' | 'waha' | 'meta';
+  provider: 'baileys' | 'waha' | 'meta' | 'openwa';
   state: string;
   connected: boolean;
   labelsReady?: boolean;
@@ -145,7 +145,7 @@ export async function connectWhatsApp(
     if (!activeSocket || !connected) throw new Error('Sessão WhatsApp desconectada; listas indisponíveis.');
     if (!labelSyncReady) {
       if (!labelSyncInFlight || !(await labelSyncInFlight)) throw new Error('Sincronização das listas do WhatsApp ainda não foi confirmada.');
-    } else if (Date.now() - labelSyncAt >= 1_500 && !(await syncNativeLabels(activeSocket, false))) {
+    } else if (Date.now() - labelSyncAt >= 5_000 && !(await syncNativeLabels(activeSocket, false))) {
       throw new Error('Não foi possível confirmar as listas atuais do WhatsApp.');
     }
     return getContactLabelNames?.(jid) ?? [];

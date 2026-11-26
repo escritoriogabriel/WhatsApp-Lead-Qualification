@@ -30,7 +30,7 @@ const ProfileSchema = z.object({
 });
 
 const AssistantConfigSchema = z.object({
-  whatsappProvider: z.enum(['meta', 'waha', 'baileys']).default('waha'),
+  whatsappProvider: z.enum(['meta', 'waha', 'baileys', 'openwa']).default('waha'),
   aiProvider: z.enum(['ollama', 'gemini']).default('gemini'),
   audioTranscriptionProvider: z.enum(['disabled', 'gemini']).default('disabled'),
   officeName: z.string().min(1),
@@ -39,25 +39,12 @@ const AssistantConfigSchema = z.object({
   officeMemory: z.string().max(5000).default(''),
   forbiddenTopics: z.array(z.string().min(1).max(200)).max(50).default([]),
   materials: z.array(z.object({ title: z.string().min(1).max(160), content: z.string().min(1).max(20_000) })).max(20).default([]),
-  conversationStyleSamples: z.array(z.object({ title: z.string().min(1).max(160), content: z.string().min(1).max(12_000) })).max(5).default([]),
+  conversationStyleSamples: z.array(z.object({ title: z.string().min(1).max(160), content: z.string().min(1).max(12_000) })).max(10).default([]),
   conversationInstructions: z.string().max(4000).default('Use os exemplos somente para aprender o tom, a forma de acolher e a organização das respostas. Nunca copie nomes, telefones, processos ou fatos de clientes.'),
-  responseTemplates: z.object({
-    greeting: z.string().min(1).max(1000),
-    directQuestion: z.string().min(1).max(1000),
-    acknowledgement: z.string().min(1).max(500),
-    humanHandoff: z.string().min(1).max(1000),
-    completion: z.string().min(1).max(1000),
-  }).default({
-    greeting: 'Olá! Vou fazer algumas perguntas iniciais para encaminhar seu atendimento.',
-    directQuestion: 'Para orientar o encaminhamento, preciso primeiro concluir algumas perguntas objetivas.',
-    acknowledgement: 'Obrigado. Vou seguir com a próxima pergunta.',
-    humanHandoff: 'Vou encaminhar seu atendimento para a equipe do escritório.',
-    completion: 'Obrigado pelas informações. Vou encaminhar o resumo para a equipe do escritório.',
-  }),
   conditionalEvents: z.array(z.object({
     id: z.string().min(1).max(64),
     name: z.string().min(1).max(120),
-    trigger: z.enum(['keyword', 'first_message', 'audio']),
+    trigger: z.enum(['keyword', 'first_message', 'audio', 'urgent', 'human_requested', 'completed']),
     keywords: z.array(z.string().min(1).max(120)).max(30).default([]),
     action: z.enum(['notify_human', 'send_message', 'pause']),
     message: z.string().max(1000).default(''),
@@ -81,7 +68,7 @@ const AssistantConfigSchema = z.object({
   audioResponseDelaySeconds: z.number().finite().nonnegative().default(0),
   audioTranscriptionTimeoutSeconds: z.number().finite().positive().default(60),
   simulateTyping: z.boolean().default(true),
-  typingSecondsPerCharacter: z.number().finite().nonnegative().default(0.025),
+  typingSecondsPerCharacter: z.number().finite().nonnegative().max(1).default(0.025),
   maxCharsPerMessage: z.number().int().min(80).max(4000).default(500),
   maxMessagesPerTurn: z.number().int().min(1).max(4),
   minSecondsBetweenContactMessages: z.number().finite().nonnegative().default(0.5),
@@ -120,12 +107,18 @@ export interface RuntimeConfig {
   ollamaModel: string;
   geminiApiKey: string;
   geminiModel: string;
-  whatsappProvider: 'baileys' | 'waha' | 'meta';
+  whatsappProvider: 'baileys' | 'waha' | 'meta' | 'openwa';
   wahaApiUrl: string;
   wahaApiKey: string;
   wahaSession: string;
   wahaWebhookUrl: string;
   wahaWebhookSecret: string;
+  openwaBaseUrl: string;
+  openwaApiKey: string;
+  openwaSessionId: string;
+  openwaSessionName: string;
+  openwaWebhookUrl: string;
+  openwaWebhookSecret: string;
   metaAccessToken: string;
   metaPhoneNumberId: string;
   metaGraphApiVersion: string;
@@ -146,14 +139,19 @@ export function loadRuntimeConfig(): RuntimeConfig {
   const stored = JSON.parse(readFileSync(qualificationPath, 'utf8')) as Record<string, unknown>;
   const selectedProvider = stored.whatsappProvider ?? process.env.WHATSAPP_PROVIDER ?? 'baileys';
   const configuredProvider = String(selectedProvider).trim().toLowerCase();
-  if (configuredProvider !== 'baileys' && configuredProvider !== 'waha' && configuredProvider !== 'meta') {
-    throw new Error('WHATSAPP_PROVIDER deve ser "meta", "waha" ou "baileys".');
+  if (!['baileys', 'waha', 'meta', 'openwa'].includes(configuredProvider)) {
+    throw new Error('WHATSAPP_PROVIDER deve ser "meta", "waha", "openwa" ou "baileys".');
   }
   const parsed = validateAssistantConfig({ ...stored, whatsappProvider: configuredProvider });
   const wahaApiKey = process.env.WAHA_API_KEY ?? '';
   const wahaWebhookSecret = process.env.WAHA_WEBHOOK_SECRET ?? '';
   if (configuredProvider === 'waha' && (!wahaApiKey || !wahaWebhookSecret)) {
     throw new Error('WAHA_API_KEY e WAHA_WEBHOOK_SECRET são obrigatórios quando WHATSAPP_PROVIDER=waha.');
+  }
+  const openwaApiKey = process.env.OPENWA_API_KEY ?? '';
+  const openwaWebhookSecret = process.env.OPENWA_WEBHOOK_SECRET ?? '';
+  if (configuredProvider === 'openwa' && (!openwaApiKey || !openwaWebhookSecret)) {
+    throw new Error('OPENWA_API_KEY e OPENWA_WEBHOOK_SECRET são obrigatórios quando WHATSAPP_PROVIDER=openwa.');
   }
   const metaAccessToken = process.env.META_ACCESS_TOKEN ?? '';
   const metaPhoneNumberId = process.env.META_PHONE_NUMBER_ID ?? '';
@@ -168,12 +166,18 @@ export function loadRuntimeConfig(): RuntimeConfig {
     ollamaModel: process.env.OLLAMA_MODEL ?? 'qwen3:0.6b',
     geminiApiKey: process.env.GEMINI_API_KEY ?? '',
     geminiModel: process.env.GEMINI_MODEL ?? 'gemini-3.5-flash-lite',
-    whatsappProvider: configuredProvider,
+    whatsappProvider: configuredProvider as RuntimeConfig['whatsappProvider'],
     wahaApiUrl: (process.env.WAHA_API_URL ?? 'http://localhost:3001').replace(/\/+$/, ''),
     wahaApiKey,
     wahaSession: process.env.WAHA_SESSION ?? 'triagem',
     wahaWebhookUrl: process.env.WAHA_WEBHOOK_URL ?? 'http://localhost:3000/api/waha/webhook',
     wahaWebhookSecret,
+    openwaBaseUrl: (process.env.OPENWA_BASE_URL ?? 'http://localhost:2785').replace(/\/+$/, ''),
+    openwaApiKey,
+    openwaSessionId: process.env.OPENWA_SESSION_ID ?? '',
+    openwaSessionName: process.env.OPENWA_SESSION_NAME ?? 'triagem',
+    openwaWebhookUrl: process.env.OPENWA_WEBHOOK_URL ?? 'http://localhost:3000/api/openwa/webhook',
+    openwaWebhookSecret,
     metaAccessToken,
     metaPhoneNumberId,
     metaGraphApiVersion: (process.env.META_GRAPH_API_VERSION ?? 'v27.0').replace(/^v?/, 'v'),
@@ -193,7 +197,7 @@ export function validateAssistantConfig(value: unknown): AssistantConfig {
   const migrated = migrateLegacyTimes(value);
   const parsed = AssistantConfigSchema.parse(migrated);
   if (parsed.whatsappProvider === 'meta') {
-    throw new ConfigValidationError('whatsappProvider', 'Este fluxo depende das listas nativas do WhatsApp, indisponíveis na Meta Cloud API.', 'Selecione WAHA ou Baileys.');
+    throw new ConfigValidationError('whatsappProvider', 'Este fluxo depende das listas nativas do WhatsApp, indisponíveis na Meta Cloud API.', 'Selecione OpenWA, WAHA ou Baileys.');
   }
 
   for (const [path, seconds] of [

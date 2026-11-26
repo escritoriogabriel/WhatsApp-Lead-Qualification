@@ -14,6 +14,10 @@ import { ProviderRetryAfterError, SendOutcomeUnknownError } from './provider-err
 import type { WhatsAppLabelTarget } from './whatsapp.js';
 
 const MAX_JOB_ATTEMPTS = 5;
+// A presença de digitação é apenas cosmética: nunca deve atrasar o atendimento.
+const MAX_TYPING_SECONDS = 8;
+
+type ConversationEventTrigger = AssistantConfig['conditionalEvents'][number]['trigger'];
 
 export interface TextSender {
   (jid: string, text: string): Promise<void>;
@@ -251,6 +255,7 @@ export class QualificationWorker {
     }
 
     if (this.isHumanCommand(userText)) {
+      await this.runTriggeredEvents(job, job.jid, state, 'human_requested', history);
       await this.handoff(job, job.jid, state, history, 'Solicitação de atendimento humano');
       this.db.markMessagesProcessed(incoming.map((message) => message.id));
       return;
@@ -263,6 +268,7 @@ export class QualificationWorker {
         [this.assistant.urgencyMessage],
         'urgency-client',
       );
+      await this.runTriggeredEvents(job, job.jid, state, 'urgent', history);
       state.paused = true;
       this.db.saveConversationState(job.jid, state);
       await this.setContactLabels(job.jid, 'HUMANO');
@@ -370,6 +376,7 @@ export class QualificationWorker {
         [this.assistant.completionMessage],
         'completion-client',
       );
+      await this.runTriggeredEvents(job, job.jid, state, 'completed', history);
       state.pendingFieldId = null;
       state.completed = true;
       state.paused = true;
@@ -433,6 +440,26 @@ export class QualificationWorker {
     }
     await this.handoff(job, jid, state, history, `Evento condicional: ${event.name}`, event.message.trim() || undefined);
     return true;
+  }
+
+  private async runTriggeredEvents(
+    job: QueueJob,
+    jid: string,
+    state: ConversationState,
+    trigger: ConversationEventTrigger,
+    history: StoredMessage[],
+  ): Promise<void> {
+    const events = (this.assistant.conditionalEvents ?? []).filter(
+      (event) => event.enabled && event.trigger === trigger,
+    );
+    for (const event of events) {
+      if (event.action === 'notify_human') {
+        await this.notifyHuman(job, jid, state, `Evento da conversa: ${event.name}`, history);
+      } else if (event.message.trim()) {
+        await this.deliver(job, jid, [event.message], 'conversation-event-' + event.id);
+      }
+      this.db.recordDiagnostic(jid, 'evento-conversa', `Evento executado: ${event.name}`);
+    }
   }
 
   private chooseProfile(
@@ -682,7 +709,7 @@ export class QualificationWorker {
     try {
       await this.contacts.setTyping(item.jid, true);
       started = true;
-      const durationSeconds = Math.min(30, item.body.length * this.assistant.typingSecondsPerCharacter);
+      const durationSeconds = Math.min(MAX_TYPING_SECONDS, item.body.length * this.assistant.typingSecondsPerCharacter);
       if (durationSeconds > 0) await delaySeconds(durationSeconds);
     } catch (error) {
       this.logger.warn({ error: safeError(error) }, 'Falha ao atualizar presença de digitação; o envio seguirá após nova validação de autorização.');

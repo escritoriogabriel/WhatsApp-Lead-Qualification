@@ -3,50 +3,76 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#f4f5f2" />
+    <meta name="theme-color" content="#0e1a16" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <title>Atendimento | Painel do agente</title>
+    <title>Atendimento | Painel do escritório</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <section id="login" class="login-screen">
-      <div class="login-card">
-        <div class="brand-mark">A</div>
-        <p class="eyebrow">PAINEL DO ESCRITÓRIO</p>
-        <h1>Configure seu atendimento</h1>
-        <p class="muted">Entre com a senha do painel para editar o agente de WhatsApp.</p>
-        <form id="login-form">
-          <label for="password">Senha do painel</label>
-          <input id="password" type="password" autocomplete="current-password" required autofocus />
-          <button class="button primary full" type="submit">Entrar no painel <span>→</span></button>
-          <p id="login-error" class="error" aria-live="polite"></p>
+      <div class="login-panel">
+        <div class="login-brand"><span class="brand-mark">A</span><div><strong>Atendimento</strong><small>PAINEL DO ESCRITÓRIO</small></div></div>
+        <h1>Configure o atendimento do seu escritório</h1>
+        <p class="login-lead">Ajuste a saudação, as perguntas da triagem, os eventos da conversa e importe exemplos reais do seu jeito de atender.</p>
+        <form id="login-form" class="stack">
+          <div class="field">
+            <label for="password">Senha do painel</label>
+            <input id="password" type="password" autocomplete="current-password" required autofocus />
+          </div>
+          <button class="button primary full" type="submit">Entrar no painel</button>
+          <p id="login-error" class="form-error" aria-live="polite"></p>
         </form>
+        <ul class="login-points">
+          <li>As mensagens enviadas ao contato são sempre textos fixos aprovados por você.</li>
+          <li>A IA só organiza as respostas recebidas; ela nunca escreve para o cliente.</li>
+          <li>As etiquetas do WhatsApp continuam sendo a única autorização de envio.</li>
+        </ul>
       </div>
     </section>
 
     <div id="app" class="shell hidden">
       <aside class="sidebar">
-        <div class="brand"><div class="brand-mark">A</div><div><strong>Atendimento</strong><small>AGENTE WHATSAPP</small></div></div>
-        <div class="nav-label">CONFIGURAÇÃO</div>
-        <nav id="nav">
-          <button class="nav-item active" data-page="overview"><span class="nav-icon">⌂</span> Visão geral</button>
-          <button class="nav-item" data-page="flow"><span class="nav-icon">☷</span> Fluxos e perguntas</button>
-          <button class="nav-item" data-page="messages"><span class="nav-icon">◌</span> Mensagens</button>
-          <button class="nav-item" data-page="knowledge"><span class="nav-icon">✦</span> Instruções e exemplos</button>
-          <button class="nav-item" data-page="preview"><span class="nav-icon">▹</span> Testar conversa</button>
-          <div class="nav-label nav-extra">OPERAÇÃO</div>
+        <div class="brand">
+          <span class="brand-mark">A</span>
+          <div><strong>Atendimento</strong><small>AGENTE WHATSAPP</small></div>
+        </div>
+        <nav id="nav" class="nav">
+          <p class="nav-label">Configurar</p>
+          <button class="nav-item" data-page="overview"><span class="nav-icon">⌂</span> Visão geral</button>
+          <button class="nav-item" data-page="messages"><span class="nav-icon">✎</span> Mensagens padrão</button>
+          <button class="nav-item" data-page="flow"><span class="nav-icon">☰</span> Fluxos e perguntas</button>
+          <button class="nav-item" data-page="events"><span class="nav-icon">⚡</span> Eventos e condições</button>
+          <button class="nav-item" data-page="knowledge"><span class="nav-icon">✦</span> Estilo e materiais</button>
+          <button class="nav-item" data-page="preview"><span class="nav-icon">▷</span> Testar conversa</button>
+          <p class="nav-label">Operar</p>
           <button class="nav-item" data-page="whatsapp"><span class="nav-icon">◉</span> Conexão WhatsApp</button>
-          <button class="nav-item" data-page="contacts"><span class="nav-icon">♙</span> Regras das listas</button>
-          <button class="nav-item" data-page="diagnostics"><span class="nav-icon">◉</span> Fila e diagnósticos</button>
+          <button class="nav-item" data-page="lists"><span class="nav-icon">☑</span> Regras das listas</button>
+          <button class="nav-item" data-page="diagnostics"><span class="nav-icon">◷</span> Fila e diagnósticos</button>
         </nav>
-        <div class="sidebar-foot"><div class="connection-dot"></div><span>Painel local conectado</span><button id="logout" title="Sair">↗</button></div>
+        <div class="sidebar-foot">
+          <span class="dot"></span>
+          <span>Painel local conectado</span>
+          <button id="logout" title="Sair do painel">Sair</button>
+        </div>
       </aside>
+
       <main class="main">
-        <header class="topbar"><div><span class="crumb">Configuração do agente</span><span id="page-title" class="page-title">Visão geral</span></div><div class="top-actions"><span id="save-state" class="save-state">Alterações salvas</span><button id="restore" class="button quiet">Restaurar versão anterior</button><button id="save" class="button primary">Salvar alterações <span>↗</span></button></div></header>
+        <header class="topbar">
+          <div class="topbar-title">
+            <span class="crumb">Configuração do agente</span>
+            <span id="page-title" class="page-title">Visão geral</span>
+          </div>
+          <div class="top-actions">
+            <span id="save-state" class="save-state">Tudo salvo</span>
+            <button id="restore" class="button quiet">Restaurar versão</button>
+            <button id="save" class="button primary">Salvar alterações</button>
+          </div>
+        </header>
         <div id="validation-errors" class="error-summary hidden" role="alert"></div>
         <div id="content" class="content"></div>
       </main>
     </div>
+
     <div id="toast" class="toast" aria-live="polite"></div>
     <script src="/app.js" defer></script>
   </body>

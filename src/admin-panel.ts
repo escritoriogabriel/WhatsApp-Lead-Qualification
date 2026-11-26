@@ -10,6 +10,7 @@ import { ConfigValidationError, validateAssistantConfig, type AssistantConfig } 
 import { AgentDatabase } from './database.js';
 import type { WhatsAppStatus } from './whatsapp.js';
 import { validMetaSignature } from './meta.js';
+import { validOpenwaSignature } from './openwa.js';
 
 interface PanelOptions {
   configPath: string;
@@ -26,6 +27,8 @@ interface PanelOptions {
   restartWhatsApp: () => Promise<void>;
   handleWahaWebhook?: (body: unknown) => Promise<void>;
   wahaWebhookSecret?: string;
+  handleOpenwaWebhook?: (body: unknown) => Promise<void>;
+  openwaWebhookSecret?: string;
   handleMetaWebhook?: (body: unknown) => Promise<void>;
   metaAppSecret?: string;
   metaWebhookVerifyToken?: string;
@@ -67,6 +70,35 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
         } catch (error) {
           options.logger.error({ error: error instanceof Error ? error.message : String(error) }, 'Falha ao processar webhook WAHA');
           sendJson(response, 500, { error: 'Falha ao processar evento WAHA; a entrega pode ser repetida.' });
+          return;
+        }
+        sendJson(response, 200, { ok: true });
+        return;
+      }
+      if (request.method === 'POST' && url.pathname === '/api/openwa/webhook') {
+        if (!options.handleOpenwaWebhook || !options.openwaWebhookSecret) {
+          sendJson(response, 404, { error: 'Webhook OpenWA não está ativo.' });
+          return;
+        }
+        // The HMAC is computed over the exact bytes received, before any parsing.
+        const rawBody = await readRaw(request, 1_000_000);
+        const signatureHeader = request.headers['x-openwa-signature'];
+        const signature = Array.isArray(signatureHeader) ? signatureHeader[0] : signatureHeader;
+        if (!validOpenwaSignature(rawBody, signature, options.openwaWebhookSecret)) {
+          sendJson(response, 401, { error: 'Assinatura do webhook inválida.' });
+          return;
+        }
+        let webhookBody: unknown;
+        try { webhookBody = JSON.parse(rawBody.toString('utf8')) as unknown; }
+        catch {
+          sendJson(response, 400, { error: 'JSON de webhook inválido.' });
+          return;
+        }
+        try {
+          await options.handleOpenwaWebhook(webhookBody);
+        } catch {
+          options.logger.error('Falha ao processar evento do webhook OpenWA.');
+          sendJson(response, 500, { error: 'Falha ao processar evento OpenWA; a entrega pode ser repetida.' });
           return;
         }
         sendJson(response, 200, { ok: true });
@@ -210,6 +242,7 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
               if (!['.txt', '.md', '.markdown'].includes(extname(upload.filename).toLowerCase())) throw new Error('Envie um arquivo TXT ou Markdown exportado da conversa.');
               const content = new TextDecoder('utf-8').decode(upload.buffer).replaceAll('\u0000', '').trim();
               if (!content) throw new Error('Nenhum texto legível foi encontrado.');
+              if (samples.length >= 10) throw new Error('Limite de 10 exemplos de conversa atingido. Remova um exemplo antes de importar outro.');
               if (content.length > 12_000 || totalCharacters + content.length > 30_000) throw new Error('Os exemplos aceitam até 12.000 caracteres por arquivo e 30.000 no conjunto.');
               samples.push({ title: basenameSafe(upload.filename).slice(0, 160), content });
               totalCharacters += content.length;
