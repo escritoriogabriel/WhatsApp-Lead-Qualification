@@ -39,6 +39,30 @@ const AssistantConfigSchema = z.object({
   officeMemory: z.string().max(5000).default(''),
   forbiddenTopics: z.array(z.string().min(1).max(200)).max(50).default([]),
   materials: z.array(z.object({ title: z.string().min(1).max(160), content: z.string().min(1).max(20_000) })).max(20).default([]),
+  conversationStyleSamples: z.array(z.object({ title: z.string().min(1).max(160), content: z.string().min(1).max(12_000) })).max(5).default([]),
+  conversationInstructions: z.string().max(4000).default('Use os exemplos somente para aprender o tom, a forma de acolher e a organização das respostas. Nunca copie nomes, telefones, processos ou fatos de clientes.'),
+  responseTemplates: z.object({
+    greeting: z.string().min(1).max(1000),
+    directQuestion: z.string().min(1).max(1000),
+    acknowledgement: z.string().min(1).max(500),
+    humanHandoff: z.string().min(1).max(1000),
+    completion: z.string().min(1).max(1000),
+  }).default({
+    greeting: 'Olá! Vou fazer algumas perguntas iniciais para encaminhar seu atendimento.',
+    directQuestion: 'Para orientar o encaminhamento, preciso primeiro concluir algumas perguntas objetivas.',
+    acknowledgement: 'Obrigado. Vou seguir com a próxima pergunta.',
+    humanHandoff: 'Vou encaminhar seu atendimento para a equipe do escritório.',
+    completion: 'Obrigado pelas informações. Vou encaminhar o resumo para a equipe do escritório.',
+  }),
+  conditionalEvents: z.array(z.object({
+    id: z.string().min(1).max(64),
+    name: z.string().min(1).max(120),
+    trigger: z.enum(['keyword', 'first_message', 'audio']),
+    keywords: z.array(z.string().min(1).max(120)).max(30).default([]),
+    action: z.enum(['notify_human', 'send_message', 'pause']),
+    message: z.string().max(1000).default(''),
+    enabled: z.boolean().default(true),
+  })).max(20).default([]),
   greeting: z.string().min(1),
   assistantNotice: z.string().min(1).max(500).default('Sou um assistente virtual e faço somente a triagem inicial. Não sou advogado.'),
   privacyNotice: z.string().max(1000).default('Compartilhe apenas as informações necessárias para esta triagem. Não envie documentos ou dados sensíveis nesta conversa.'),
@@ -207,6 +231,10 @@ export function validateAssistantConfig(value: unknown): AssistantConfig {
     throw new ConfigValidationError('externalProviderNotice', 'O aviso de uso do provedor externo precisa caber em um balão.', 'Reduza o texto do aviso ou aumente o limite de caracteres por balão.');
   }
   const materialCharacters = parsed.materials.reduce((total, material) => total + material.content.length, 0);
+  const sampleCharacters = parsed.conversationStyleSamples.reduce((total, sample) => total + sample.content.length, 0);
+  if (sampleCharacters > 30_000) {
+    throw new ConfigValidationError('conversationStyleSamples', 'Os exemplos de conversa ultrapassam o total permitido.', 'Reduza os exemplos para até 30.000 caracteres no conjunto.');
+  }
   if (materialCharacters > 20_000) {
     throw new ConfigValidationError('materials', 'O conteúdo dos materiais ultrapassa o total permitido.', 'Reduza o material para até 20.000 caracteres no conjunto.');
   }
