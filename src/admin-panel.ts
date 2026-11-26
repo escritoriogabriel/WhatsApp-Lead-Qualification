@@ -9,6 +9,7 @@ import { z } from 'zod';
 import { ConfigValidationError, validateAssistantConfig, type AssistantConfig } from './config.js';
 import { AgentDatabase, type ContactAssignment } from './database.js';
 import type { WhatsAppStatus } from './whatsapp.js';
+import { validMetaSignature } from './meta.js';
 
 interface PanelOptions {
   configPath: string;
@@ -17,7 +18,7 @@ interface PanelOptions {
   port: number;
   password: string;
   getConfig: () => AssistantConfig;
-  setConfig: (config: AssistantConfig) => void;
+  setConfig: (config: AssistantConfig) => Promise<void> | void;
   database: AgentDatabase;
   setContactAssignment: (jid: string, assignment: ContactAssignment) => Promise<void>;
   getWhatsAppStatus: () => Promise<WhatsAppStatus>;
@@ -25,6 +26,9 @@ interface PanelOptions {
   restartWhatsApp: () => Promise<void>;
   handleWahaWebhook?: (body: unknown) => Promise<void>;
   wahaWebhookSecret?: string;
+  handleMetaWebhook?: (body: unknown) => Promise<void>;
+  metaAppSecret?: string;
+  metaWebhookVerifyToken?: string;
   logger: Logger;
 }
 
@@ -32,6 +36,9 @@ const MAX_BODY_BYTES = 300_000;
 const MAX_UPLOAD_FILE_BYTES = 15 * 1024 * 1024;
 const MAX_UPLOAD_TOTAL_BYTES = 25 * 1024 * 1024;
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+
+class PayloadTooLargeError extends Error {}
+class InvalidRequestError extends Error {}
 
 export async function startAdminPanel(options: PanelOptions): Promise<() => Promise<void>> {
   const password = await resolvePanelPassword(options.password);
@@ -56,6 +63,49 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
         } catch (error) {
           options.logger.error({ error: error instanceof Error ? error.message : String(error) }, 'Falha ao processar webhook WAHA');
           sendJson(response, 500, { error: 'Falha ao processar evento WAHA; a entrega pode ser repetida.' });
+          return;
+        }
+        sendJson(response, 200, { ok: true });
+        return;
+      }
+      if (url.pathname === '/api/meta/webhook' && request.method === 'GET') {
+        const mode = url.searchParams.get('hub.mode');
+        const token = url.searchParams.get('hub.verify_token') ?? '';
+        const challenge = url.searchParams.get('hub.challenge');
+        if (mode !== 'subscribe' || !challenge || !options.metaWebhookVerifyToken ||
+          !safeEqual(token, options.metaWebhookVerifyToken)) {
+          response.statusCode = 403;
+          response.end('Webhook verification failed.');
+          return;
+        }
+        response.statusCode = 200;
+        response.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        response.end(challenge);
+        return;
+      }
+      if (request.method === 'POST' && url.pathname === '/api/meta/webhook') {
+        if (!options.handleMetaWebhook || !options.metaAppSecret) {
+          sendJson(response, 404, { error: 'Webhook Meta não está ativo.' });
+          return;
+        }
+        const rawBody = await readRaw(request, 1_000_000);
+        const signatureHeader = request.headers['x-hub-signature-256'];
+        const signature = Array.isArray(signatureHeader) ? signatureHeader[0] : signatureHeader;
+        if (!validMetaSignature(rawBody, signature, options.metaAppSecret)) {
+          sendJson(response, 401, { error: 'Assinatura do webhook inválida.' });
+          return;
+        }
+        let webhookBody: unknown;
+        try { webhookBody = JSON.parse(rawBody.toString('utf8')) as unknown; }
+        catch {
+          sendJson(response, 400, { error: 'JSON de webhook inválido.' });
+          return;
+        }
+        try {
+          await options.handleMetaWebhook(webhookBody);
+        } catch {
+          options.logger.error('Falha ao persistir evento do webhook Meta.');
+          sendJson(response, 500, { error: 'Falha ao persistir evento Meta; a entrega pode ser repetida.' });
           return;
         }
         sendJson(response, 200, { ok: true });
@@ -181,7 +231,7 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
             const candidate = validateAssistantConfig({ ...options.getConfig(), materials });
             await saveRevision(options.configPath, revisionsDir);
             await atomicWrite(options.configPath, JSON.stringify(candidate, null, 2) + '\n');
-            options.setConfig(candidate);
+            await options.setConfig(candidate);
           }
           sendJson(response, 200, { imported: results.filter((item) => item.ok).length, results });
           return;
@@ -206,20 +256,16 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
             sendJson(response, 400, { error: 'Informe um telefone válido e a lista Novo Lead, Bot - atendimento ou Atendimento.' });
             return;
           }
-          let contactAssignment = assignment;
+          const contactAssignment = assignment;
           options.database.ensureContact(jid, 'PAUSADO', 'panel');
           try {
             await options.setContactAssignment(jid, contactAssignment);
-            if (contactAssignment === 'PAUSADO') {
-              await options.setContactAssignment(jid, 'BOT');
-              contactAssignment = 'BOT';
-            }
           } catch (error) {
-            options.database.setContactAssignment(jid, 'PAUSADO', 'panel-list-sync-failed');
-            options.database.recordDiagnostic(jid, 'falha-lista', error instanceof Error ? error.message : 'Falha ao sincronizar lista do WhatsApp.');
-            throw error;
+            options.database.blockAutomation(jid, 'system-assignment-sync');
+            options.database.recordDiagnostic(jid, 'falha-lista', 'Não foi possível confirmar a atribuição no provedor WhatsApp.');
+            throw new Error('Não foi possível confirmar a atribuição no provedor WhatsApp. O contato permanece pausado.');
           }
-          options.database.setContactAssignment(jid, contactAssignment, contactAssignment === 'BOT' && assignment === 'PAUSADO' ? 'new-lead' : 'panel');
+          options.database.setContactAssignment(jid, contactAssignment, contactAssignment === 'PAUSADO' ? 'panel-pause' : 'panel');
           if (contactAssignment === 'BOT') options.database.queueConversationStart(jid);
           options.database.recordDiagnostic(jid, 'atribuicao', `Alterada no painel: ${contactAssignment}`);
           sendJson(response, 200, { ok: true, jid, assignment: contactAssignment });
@@ -241,21 +287,17 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
               continue;
             }
             try {
-              let contactAssignment = assignment;
+              const contactAssignment = assignment;
               options.database.ensureContact(jid, 'PAUSADO', 'csv-import');
               if (row.name) options.database.setContactName(jid, row.name.slice(0, 120));
               await options.setContactAssignment(jid, contactAssignment);
-              if (contactAssignment === 'PAUSADO') {
-                await options.setContactAssignment(jid, 'BOT');
-                contactAssignment = 'BOT';
-              }
-              options.database.setContactAssignment(jid, contactAssignment, assignment === 'PAUSADO' ? 'new-lead' : 'csv-import');
+              options.database.setContactAssignment(jid, contactAssignment, assignment === 'PAUSADO' ? 'panel-pause' : 'csv-import');
               if (contactAssignment === 'BOT') options.database.queueConversationStart(jid);
               options.database.recordDiagnostic(jid, 'importacao', `CSV: ${contactAssignment}`);
               results.push({ phone: row.phone, assignment: row.assignment, ok: true });
             } catch (error) {
               const message = error instanceof Error ? error.message : 'Falha ao sincronizar etiqueta.';
-              options.database.setContactAssignment(jid, 'PAUSADO', 'csv-list-sync-failed');
+              options.database.blockAutomation(jid, 'system-assignment-sync');
               options.database.recordDiagnostic(jid, 'falha-importacao', message);
               results.push({ phone: row.phone, assignment: row.assignment, ok: false, error: message });
             }
@@ -275,9 +317,15 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
             return;
           }
           const candidate = validateAssistantConfig(await readJson(request));
-          await saveRevision(options.configPath, revisionsDir);
-          await atomicWrite(options.configPath, JSON.stringify(candidate, null, 2) + '\n');
-          options.setConfig(candidate);
+          const previous = options.getConfig();
+          await options.setConfig(candidate);
+          try {
+            await saveRevision(options.configPath, revisionsDir);
+            await atomicWrite(options.configPath, JSON.stringify(candidate, null, 2) + '\n');
+          } catch (error) {
+            await options.setConfig(previous);
+            throw error;
+          }
           sendJson(response, 200, { ok: true, savedAt: new Date().toISOString() });
           return;
         }
@@ -293,9 +341,15 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
             return;
           }
           const restored = validateAssistantConfig(JSON.parse(await readFile(join(revisionsDir, latest), 'utf8')));
-          await saveRevision(options.configPath, revisionsDir);
-          await atomicWrite(options.configPath, JSON.stringify(restored, null, 2) + '\n');
-          options.setConfig(restored);
+          const previous = options.getConfig();
+          await options.setConfig(restored);
+          try {
+            await saveRevision(options.configPath, revisionsDir);
+            await atomicWrite(options.configPath, JSON.stringify(restored, null, 2) + '\n');
+          } catch (error) {
+            await options.setConfig(previous);
+            throw error;
+          }
           sendJson(response, 200, { ok: true, revision: latest });
           return;
         }
@@ -323,6 +377,14 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
       response.setHeader('Cache-Control', 'no-store');
       response.end(request.method === 'HEAD' ? undefined : content);
     } catch (error) {
+      if (error instanceof PayloadTooLargeError) {
+        sendJson(response, 413, { error: 'Corpo da requisição excede o limite permitido.' });
+        return;
+      }
+      if (error instanceof InvalidRequestError) {
+        sendJson(response, 400, { error: error.message });
+        return;
+      }
       const message = error instanceof Error ? error.message : 'Erro interno';
       options.logger.error({ error: message }, 'Admin panel request failed');
       const details = error instanceof z.ZodError
@@ -575,17 +637,26 @@ function sameOrigin(request: IncomingMessage): boolean {
 }
 
 async function readJson(request: IncomingMessage): Promise<Record<string, unknown>> {
+  let value: unknown;
+  try { value = JSON.parse((await readRaw(request, MAX_BODY_BYTES)).toString('utf8')); }
+  catch (error) {
+    if (error instanceof PayloadTooLargeError) throw error;
+    throw new InvalidRequestError('JSON inválido.');
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new InvalidRequestError('JSON inválido.');
+  return value as Record<string, unknown>;
+}
+
+async function readRaw(request: IncomingMessage, maxBytes: number): Promise<Buffer> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of request) {
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += bytes.length;
-    if (size > MAX_BODY_BYTES) throw new Error('Corpo da requisição excede o limite.');
+    if (size > maxBytes) throw new PayloadTooLargeError('Corpo da requisição excede o limite.');
     chunks.push(bytes);
   }
-  const value: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('JSON inválido.');
-  return value as Record<string, unknown>;
+  return Buffer.concat(chunks);
 }
 
 async function atomicWrite(path: string, content: string): Promise<void> {

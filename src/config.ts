@@ -30,6 +30,9 @@ const ProfileSchema = z.object({
 });
 
 const AssistantConfigSchema = z.object({
+  whatsappProvider: z.enum(['meta', 'waha', 'baileys']).default('waha'),
+  aiProvider: z.enum(['ollama', 'gemini']).default('ollama'),
+  audioTranscriptionProvider: z.enum(['disabled', 'gemini']).default('disabled'),
   officeName: z.string().min(1),
   assistantName: z.string().min(1),
   writingStyle: z.string().min(1),
@@ -37,10 +40,17 @@ const AssistantConfigSchema = z.object({
   forbiddenTopics: z.array(z.string().min(1).max(200)).max(50).default([]),
   materials: z.array(z.object({ title: z.string().min(1).max(160), content: z.string().min(1).max(20_000) })).max(20).default([]),
   greeting: z.string().min(1),
+  firstMessagePolicy: z.enum(['auto', 'explicit']).default('explicit'),
+  assistantNotice: z.string().min(1).max(500).default('Sou um assistente virtual e faço somente a triagem inicial. Não sou advogado.'),
+  privacyNotice: z.string().max(1000).default('Compartilhe apenas as informações necessárias para esta triagem. Não envie documentos ou dados sensíveis nesta conversa.'),
+  externalProviderNotice: z.string().min(1).max(1000).default('Para continuar, o conteúdo que você enviar após este aviso poderá ser enviado ao Google Gemini para processamento da triagem. Se preferir, peça atendimento humano ou não continue.'),
   areaQuestion: z.string().min(1).max(500).default('Qual área do Direito ou assunto melhor descreve o seu caso?'),
   areaFieldId: z.string().min(1).max(64).default('assunto'),
   handoffMessage: z.string().min(1),
   audioRetryMessage: z.string().min(1),
+  clarificationMessage: z.string().min(1).max(1000).default('Não consegui identificar essa informação com segurança. Você pode responder de outra forma ou pedir atendimento humano?'),
+  aiFallbackMessage: z.string().min(1).max(1000).default('Não consegui continuar a triagem com segurança. Vou encaminhar seu atendimento para a equipe.'),
+  acknowledgementMessage: z.string().min(1).max(300).default('Obrigado. Vou seguir com a próxima pergunta.'),
   completionMessage: z.string().min(1),
   urgencyMessage: z.string().min(1),
   batchWindowSeconds: z.number().finite().nonnegative(),
@@ -51,12 +61,22 @@ const AssistantConfigSchema = z.object({
   typingSecondsPerCharacter: z.number().finite().nonnegative().default(0.025),
   maxCharsPerMessage: z.number().int().min(80).max(4000).default(500),
   maxMessagesPerTurn: z.number().int().min(1).max(4),
+  minSecondsBetweenContactMessages: z.number().finite().nonnegative().default(0.5),
+  maxMessagesPerContactPerDay: z.number().int().min(1).max(100_000).default(30),
+  maxMessagesPerContactPerMonth: z.number().int().min(1).max(1_000_000).default(300),
+  maxMessagesSentPerDay: z.number().int().min(1).max(1_000_000).default(2_000),
+  maxMessagesSentPerMonth: z.number().int().min(1).max(10_000_000).default(20_000),
+  retentionDays: z.number().int().min(1).max(3650).default(90),
   newContactsOnly: z.boolean().default(true),
   maxFieldAttempts: z.number().int().min(1).max(5),
   maxAudioBytes: z.number().int().min(1024).max(25_000_000),
   maxHistoryMessages: z.number().int().min(1).max(50),
   workerPollMs: z.number().int().min(100).max(10_000),
   handoffKeywords: z.array(z.string().min(1)),
+  legalQuestionKeywords: z.array(z.string().min(1)).max(100).default([
+    'tenho direito', 'posso processar', 'qual o prazo', 'o que devo fazer', 'quanto vou receber',
+    'posso ser demitido', 'posso pedir', 'vale a pena entrar', 'quais são meus direitos',
+  ]),
   humanCommand: z.string().min(1).max(40),
   defaultProfileId: z.string().min(1),
   profiles: z.array(ProfileSchema).min(1).max(20),
@@ -74,14 +94,21 @@ export class ConfigValidationError extends Error {
 }
 
 export interface RuntimeConfig {
+  ollamaApiUrl: string;
+  ollamaModel: string;
   geminiApiKey: string;
   geminiModel: string;
-  whatsappProvider: 'baileys' | 'waha';
+  whatsappProvider: 'baileys' | 'waha' | 'meta';
   wahaApiUrl: string;
   wahaApiKey: string;
   wahaSession: string;
   wahaWebhookUrl: string;
   wahaWebhookSecret: string;
+  metaAccessToken: string;
+  metaPhoneNumberId: string;
+  metaGraphApiVersion: string;
+  metaAppSecret: string;
+  metaWebhookVerifyToken: string;
   databasePath: string;
   authDir: string;
   mediaDir: string;
@@ -94,18 +121,29 @@ export interface RuntimeConfig {
 export function loadRuntimeConfig(): RuntimeConfig {
   const qualificationPath =
     process.env.CONFIG_PATH ?? 'config/qualification.json';
-  const parsed = validateAssistantConfig(JSON.parse(readFileSync(qualificationPath, 'utf8')));
-  const configuredProvider = (process.env.WHATSAPP_PROVIDER ?? 'baileys').trim().toLowerCase();
-  if (configuredProvider !== 'baileys' && configuredProvider !== 'waha') {
-    throw new Error('WHATSAPP_PROVIDER deve ser "baileys" ou "waha".');
+  const stored = JSON.parse(readFileSync(qualificationPath, 'utf8')) as Record<string, unknown>;
+  const selectedProvider = stored.whatsappProvider ?? process.env.WHATSAPP_PROVIDER ?? 'baileys';
+  const configuredProvider = String(selectedProvider).trim().toLowerCase();
+  if (configuredProvider !== 'baileys' && configuredProvider !== 'waha' && configuredProvider !== 'meta') {
+    throw new Error('WHATSAPP_PROVIDER deve ser "meta", "waha" ou "baileys".');
   }
+  const parsed = validateAssistantConfig({ ...stored, whatsappProvider: configuredProvider });
   const wahaApiKey = process.env.WAHA_API_KEY ?? '';
   const wahaWebhookSecret = process.env.WAHA_WEBHOOK_SECRET ?? '';
   if (configuredProvider === 'waha' && (!wahaApiKey || !wahaWebhookSecret)) {
     throw new Error('WAHA_API_KEY e WAHA_WEBHOOK_SECRET são obrigatórios quando WHATSAPP_PROVIDER=waha.');
   }
+  const metaAccessToken = process.env.META_ACCESS_TOKEN ?? '';
+  const metaPhoneNumberId = process.env.META_PHONE_NUMBER_ID ?? '';
+  const metaAppSecret = process.env.META_APP_SECRET ?? '';
+  const metaWebhookVerifyToken = process.env.META_WEBHOOK_VERIFY_TOKEN ?? '';
+  if (configuredProvider === 'meta' && (!metaAccessToken || !metaPhoneNumberId || !metaAppSecret || !metaWebhookVerifyToken)) {
+    throw new Error('META_ACCESS_TOKEN, META_PHONE_NUMBER_ID, META_APP_SECRET e META_WEBHOOK_VERIFY_TOKEN são obrigatórios quando WHATSAPP_PROVIDER=meta.');
+  }
 
   return {
+    ollamaApiUrl: (process.env.OLLAMA_API_URL ?? 'http://localhost:11434').replace(/\/+$/, ''),
+    ollamaModel: process.env.OLLAMA_MODEL ?? 'qwen3:4b',
     geminiApiKey: process.env.GEMINI_API_KEY ?? '',
     geminiModel: process.env.GEMINI_MODEL ?? 'gemini-3.5-flash',
     whatsappProvider: configuredProvider,
@@ -114,6 +152,11 @@ export function loadRuntimeConfig(): RuntimeConfig {
     wahaSession: process.env.WAHA_SESSION ?? 'triagem',
     wahaWebhookUrl: process.env.WAHA_WEBHOOK_URL ?? 'http://localhost:3000/api/waha/webhook',
     wahaWebhookSecret,
+    metaAccessToken,
+    metaPhoneNumberId,
+    metaGraphApiVersion: (process.env.META_GRAPH_API_VERSION ?? 'v27.0').replace(/^v?/, 'v'),
+    metaAppSecret,
+    metaWebhookVerifyToken,
     databasePath: process.env.DATABASE_PATH ?? 'data/agent.sqlite',
     authDir: process.env.AUTH_DIR ?? 'data/auth',
     mediaDir: process.env.MEDIA_DIR ?? 'data/tmp',
@@ -134,6 +177,7 @@ export function validateAssistantConfig(value: unknown): AssistantConfig {
     ['audioResponseDelaySeconds', parsed.audioResponseDelaySeconds],
     ['audioTranscriptionTimeoutSeconds', parsed.audioTranscriptionTimeoutSeconds],
     ['typingSecondsPerCharacter', parsed.typingSecondsPerCharacter],
+    ['minSecondsBetweenContactMessages', parsed.minSecondsBetweenContactMessages],
   ] as const) {
     if (!Number.isFinite(seconds * 1000) || seconds * 1000 > Number.MAX_SAFE_INTEGER) {
       throw new ConfigValidationError(path, 'Esta duração não pode ser representada com segurança.', 'Use uma duração menor; não há limite de interface, mas o sistema precisa conseguir medir o tempo.');
@@ -157,6 +201,9 @@ export function validateAssistantConfig(value: unknown): AssistantConfig {
 
   if (!parsed.profiles.every((profile) => profile.fields.some((field) => field.id === parsed.areaFieldId && field.required))) {
     throw new ConfigValidationError('areaFieldId', 'O campo de área precisa existir e ser obrigatório em todos os fluxos.', 'Escolha um campo obrigatório que exista em cada fluxo.');
+  }
+  if ((parsed.aiProvider === 'gemini' || parsed.audioTranscriptionProvider === 'gemini') && parsed.externalProviderNotice.length > parsed.maxCharsPerMessage) {
+    throw new ConfigValidationError('externalProviderNotice', 'O aviso de uso do provedor externo precisa caber em um balão.', 'Reduza o texto do aviso ou aumente o limite de caracteres por balão.');
   }
   const materialCharacters = parsed.materials.reduce((total, material) => total + material.content.length, 0);
   if (materialCharacters > 20_000) {

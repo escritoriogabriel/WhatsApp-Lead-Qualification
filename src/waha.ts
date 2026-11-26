@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Logger } from 'pino';
+import { ProviderRetryAfterError, SendOutcomeUnknownError } from './provider-errors.js';
 import type { RuntimeConfig } from './config.js';
 import type { ContactAssignment, IncomingMessage } from './database.js';
 import type {
@@ -36,7 +37,7 @@ const AUDIO_EXTENSIONS: Record<string, string> = {
 };
 
 class WahaApiError extends Error {
-  constructor(message: string, readonly status: number) {
+  constructor(message: string, readonly status: number, readonly retryAfterMs = 60_000) {
     super(message);
     this.name = 'WahaApiError';
   }
@@ -136,7 +137,9 @@ class WahaAdapter {
   connection(): WhatsAppConnection {
     return {
       sendText: (jid, text) => this.sendText(jid, text),
+      setTyping: (jid, typing) => this.setTyping(jid, typing),
       setContactAssignment: (jid, assignment) => this.setContactAssignment(jid, assignment),
+      getContactAssignment: (jid) => this.getContactAssignment(jid),
       renameContact: (jid, name) => this.renameContact(jid, name),
       getStatus: () => this.getStatus(),
       getQrPng: () => this.getQrPng(),
@@ -218,28 +221,25 @@ class WahaAdapter {
 
   private async sendText(jid: string, text: string): Promise<void> {
     const chatId = toWahaChatId(jid);
-    if (this.config.assistant.simulateTyping) {
-      await this.requestJson(`/api/startTyping`, {
-        method: 'POST',
-        body: JSON.stringify({ session: this.sessionName, chatId }),
-      }).catch(() => undefined);
-      if (this.config.assistant.typingSecondsPerCharacter > 0) {
-        await delaySeconds(text.length * this.config.assistant.typingSecondsPerCharacter);
-      }
-    }
     try {
       await this.requestJson('/api/sendText', {
         method: 'POST',
         body: JSON.stringify({ session: this.sessionName, chatId, text }),
       });
-    } finally {
-      if (this.config.assistant.simulateTyping) {
-        await this.requestJson('/api/stopTyping', {
-          method: 'POST',
-          body: JSON.stringify({ session: this.sessionName, chatId }),
-        }).catch(() => undefined);
-      }
+    } catch (error) {
+      if (error instanceof WahaApiError && error.status === 429) throw new ProviderRetryAfterError(error.retryAfterMs);
+      if (error instanceof WahaApiError && error.status >= 500) throw new SendOutcomeUnknownError();
+      if (!(error instanceof WahaApiError)) throw new SendOutcomeUnknownError();
+      throw error;
     }
+  }
+
+  private async setTyping(jid: string, typing: boolean): Promise<void> {
+    const chatId = toWahaChatId(jid);
+    await this.requestJson(`/api/${typing ? 'startTyping' : 'stopTyping'}`, {
+      method: 'POST',
+      body: JSON.stringify({ session: this.sessionName, chatId }),
+    });
   }
 
   private async setContactAssignment(jid: string, assignment: ContactAssignment): Promise<void> {
@@ -270,6 +270,18 @@ class WahaAdapter {
       method: 'PUT',
       body: JSON.stringify({ labels: nextIds.map((id) => ({ id })) }),
     });
+  }
+
+  private async getContactAssignment(jid: string): Promise<ContactAssignment> {
+    const labels = await this.getLabels();
+    const current = extractLabels(await this.requestJson(
+      `/api/${encodeURIComponent(this.sessionName)}/labels/chats/${encodeURIComponent(toWahaChatId(jid))}/`,
+    ));
+    const names = current.map((label) => label.name || labels.find((candidate) => candidate.id === label.id)?.name || '')
+      .map((name) => name.trim().toLocaleLowerCase('pt-BR'));
+    if (names.some((name) => name === 'atendimento' || name === 'humano')) return 'HUMANO';
+    if (names.includes('bot - atendimento')) return 'BOT';
+    return 'PAUSADO';
   }
 
   private async getLabels(): Promise<RemoteLabel[]> {
@@ -349,10 +361,10 @@ class WahaAdapter {
         try {
           mediaPath = await this.downloadAudio(audioUrl, mimeType);
         } catch (error) {
-          this.logger.warn({ jid, error: safeError(error) }, 'Não foi possível baixar o áudio recebido pelo WAHA');
+          this.logger.warn({ error: safeError(error) }, 'Não foi possível baixar um áudio recebido pelo WAHA');
         }
       } else if (audioUrl) {
-        this.logger.warn({ jid, mimeType }, 'Formato de áudio não reconhecido para transcrição');
+        this.logger.warn({ mimeType }, 'Formato de áudio não reconhecido para transcrição');
       }
       const timestamp = getNumber(payload.timestamp, Date.now());
       await this.callbacks.onIncoming({
@@ -440,8 +452,7 @@ class WahaAdapter {
   }
 
   private async apiError(response: Response): Promise<WahaApiError> {
-    const detail = (await response.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 300);
-    return new WahaApiError(`WAHA respondeu HTTP ${response.status}${detail ? `: ${detail}` : ''}`, response.status);
+    return new WahaApiError(`WAHA respondeu HTTP ${response.status}.`, response.status, parseRetryAfter(response.headers.get('retry-after')));
   }
 }
 
@@ -479,20 +490,17 @@ function getNumber(value: unknown, fallback: number): number {
   const number = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
   return Number.isFinite(number) ? number : fallback;
 }
+function parseRetryAfter(value: string | null): number {
+  if (!value) return 60_000;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds > 0) return Math.min(24 * 60 * 60 * 1000, Math.ceil(seconds * 1000));
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(1_000, Math.min(24 * 60 * 60 * 1000, date - Date.now())) : 60_000;
+}
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
-function delaySeconds(seconds: number): Promise<void> {
-  let remaining = Math.max(0, seconds * 1000);
-  return new Promise((resolve) => {
-    const wait = () => {
-      const step = Math.min(remaining, 60_000);
-      remaining -= step;
-      setTimeout(remaining > 0 ? wait : resolve, step);
-    };
-    wait();
-  });
-}
 function safeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  if (error instanceof WahaApiError) return `WAHA HTTP ${error.status}`;
+  return error instanceof Error ? error.name : 'Falha desconhecida';
 }

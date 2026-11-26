@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { pino } from 'pino';
+import { ProviderRetryAfterError, SendOutcomeUnknownError } from './provider-errors.js';
 import type { RuntimeConfig } from './config.js';
 import type { WhatsAppCallbacks } from './whatsapp.js';
 import { connectWaha, normalizeWahaJid, toWahaChatId } from './waha.js';
@@ -20,6 +21,8 @@ test('WAHA session supports the bot queue, labels, contact updates, and WhatsApp
   let chatLabels = [{ id: '1', name: 'Novo Lead', color: 7 }, { id: '10', name: 'VIP', color: 3 }];
   let contactUpdate: Record<string, unknown> | null = null;
   let sentMessage: Record<string, unknown> | null = null;
+  let sendFailure: { status: number; retryAfter?: string } | null = null;
+  const typingEvents: Array<{ path: string; body: Record<string, unknown> }> = [];
   const incoming: Array<Record<string, unknown>> = [];
   const labelEvents: Array<Record<string, unknown>> = [];
   const associationEvents: Array<Record<string, unknown>> = [];
@@ -80,8 +83,19 @@ test('WAHA session supports the bot queue, labels, contact updates, and WhatsApp
       return;
     }
     if (request.method === 'POST' && path === '/api/sendText') {
+      if (sendFailure) {
+        response.statusCode = sendFailure.status;
+        if (sendFailure.retryAfter) response.setHeader('Retry-After', sendFailure.retryAfter);
+        response.end(JSON.stringify({ error: 'test failure' }));
+        return;
+      }
       sentMessage = body;
       response.end(JSON.stringify({ id: 'outgoing-1' }));
+      return;
+    }
+    if (request.method === 'POST' && ['/api/startTyping', '/api/stopTyping'].includes(path)) {
+      typingEvents.push({ path, body });
+      response.end(JSON.stringify({ ok: true }));
       return;
     }
     if (request.method === 'GET' && path === '/api/files/voice-1') {
@@ -123,10 +137,19 @@ test('WAHA session supports the bot queue, labels, contact updates, and WhatsApp
 
   await whatsapp.setContactAssignment('15551234567@s.whatsapp.net', 'BOT');
   assert.deepEqual(chatLabels.map((label) => label.name).sort(), ['Bot - atendimento', 'VIP']);
+  assert.equal(await whatsapp.getContactAssignment?.('15551234567@s.whatsapp.net'), 'BOT');
   await whatsapp.renameContact('15551234567@s.whatsapp.net', 'Ana Maria Silva');
   assert.deepEqual(contactUpdate, { firstName: 'Ana', lastName: 'Maria Silva' });
   await whatsapp.sendText('15551234567@s.whatsapp.net', 'Olá');
   assert.deepEqual(sentMessage, { session: 'triagem', chatId: '15551234567@c.us', text: 'Olá' });
+  await whatsapp.setTyping?.('15551234567@s.whatsapp.net', true);
+  await whatsapp.setTyping?.('15551234567@s.whatsapp.net', false);
+  assert.deepEqual(typingEvents.map((item) => item.path), ['/api/startTyping', '/api/stopTyping']);
+  sendFailure = { status: 429, retryAfter: '3' };
+  await assert.rejects(whatsapp.sendText('15551234567@s.whatsapp.net', 'limite'), (error: unknown) => error instanceof ProviderRetryAfterError && error.retryAfterMs === 3_000);
+  sendFailure = { status: 503 };
+  await assert.rejects(whatsapp.sendText('15551234567@s.whatsapp.net', 'resultado incerto'), SendOutcomeUnknownError);
+  sendFailure = null;
 
   await whatsapp.handleWebhook?.({
     event: 'message',

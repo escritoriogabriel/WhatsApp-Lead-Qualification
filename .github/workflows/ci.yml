@@ -16,5 +16,15 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci --allow-git=all
+      - run: npm run lint
+      - run: npm test
       - run: npm run typecheck
       - run: npm run build
+      - name: Prepare Compose validation environment
+        run: touch .env
+      - name: Validate Compose
+        env:
+          WAHA_API_KEY: ci-placeholder-api-key
+          WAHA_WEBHOOK_SECRET: ci-placeholder-webhook-secret
+          WAHA_DASHBOARD_PASSWORD: ci-placeholder-dashboard-password
+        run: docker compose config --quiet

@@ -12,11 +12,12 @@ import qrcode from 'qrcode-terminal';
 import type { Logger } from 'pino';
 import type { RuntimeConfig } from './config.js';
 import type { ContactAssignment, IncomingMessage } from './database.js';
+import { SendOutcomeUnknownError } from './provider-errors.js';
 
 export interface WhatsAppLabel { id: string; name: string; color: number; deleted: boolean }
 export interface WhatsAppLabelAssociation { type: string; chatId: string; labelId: string }
 export interface WhatsAppStatus {
-  provider: 'baileys' | 'waha';
+  provider: 'baileys' | 'waha' | 'meta';
   state: string;
   connected: boolean;
   session?: string;
@@ -35,8 +36,10 @@ const listNames = ['Novo Lead', 'Bot - atendimento', 'Atendimento'] as const;
 
 export interface WhatsAppConnection {
   sendText(jid: string, text: string): Promise<void>;
+  setTyping?(jid: string, typing: boolean): Promise<void>;
   setContactAssignment(jid: string, assignment: ContactAssignment): Promise<void>;
   renameContact(jid: string, name: string): Promise<void>;
+  getContactAssignment?(jid: string): Promise<ContactAssignment>;
   close(): Promise<void>;
   getStatus?(): Promise<WhatsAppStatus>;
   getQrPng?(): Promise<Buffer | null>;
@@ -209,15 +212,15 @@ export async function connectWhatsApp(
   return {
     async sendText(jid, text) {
       if (!socket) throw new Error('WhatsApp socket is not connected');
-      if (config.assistant.simulateTyping && config.assistant.typingSecondsPerCharacter > 0) {
-        const typingDuration = text.length * config.assistant.typingSecondsPerCharacter;
-        await socket.sendPresenceUpdate('composing', jid).catch(() => undefined);
-        await delaySeconds(typingDuration);
+      try {
+        await socket.sendMessage(jid, { text });
+      } catch {
+        throw new SendOutcomeUnknownError();
       }
-      await socket.sendMessage(jid, { text });
-      if (config.assistant.simulateTyping) {
-        await socket.sendPresenceUpdate('paused', jid).catch(() => undefined);
-      }
+    },
+    async setTyping(jid, typing) {
+      if (!socket) throw new Error('WhatsApp socket is not connected');
+      await socket.sendPresenceUpdate(typing ? 'composing' : 'paused', jid);
     },
     async setContactAssignment(jid, assignment) {
       if (!socket) throw new Error('WhatsApp socket is not connected');
@@ -313,11 +316,11 @@ async function receiveMessage(
       mediaPath = join(config.mediaDir, randomUUID() + '.ogg');
       await writeFile(mediaPath, bytes, { mode: 0o600 });
     } else {
-      logger.warn({ jid }, 'Áudio excede o limite configurado');
+      logger.warn('Áudio excede o limite configurado');
     }
   } catch (error) {
     logger.warn(
-      { jid, error: safeError(error) },
+      { error: safeError(error) },
       'Não foi possível baixar o áudio recebido',
     );
   }
@@ -371,15 +374,5 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 }
 
 function safeError(error: unknown): string {
-  return error instanceof Error ? error.message : 'Unknown WhatsApp error';
-}
-
-async function delaySeconds(seconds: number): Promise<void> {
-  let remaining = seconds * 1000;
-  const largestSafeTimer = 2_147_000_000;
-  while (remaining > 0) {
-    const step = Math.min(remaining, largestSafeTimer);
-    await new Promise<void>((resolve) => setTimeout(resolve, step));
-    remaining -= step;
-  }
+  return error instanceof Error ? error.name : 'UnknownError';
 }

@@ -1,14 +1,17 @@
 import { unlink } from 'node:fs/promises';
 import type { Logger } from 'pino';
 import type { AssistantConfig, IntakeProfile, RuntimeConfig } from './config.js';
+import type { IntakeAIProvider } from './ai.js';
 import {
   AgentDatabase,
   type ContactAssignment,
   type ConversationState,
+  type OutboundRateLimits,
   type QueueJob,
   type StoredMessage,
 } from './database.js';
-import { GeminiProvider, GeminiQuotaError } from './gemini.js';
+import { GeminiQuotaError } from './gemini.js';
+import { ProviderRetryAfterError, SendOutcomeUnknownError } from './provider-errors.js';
 
 const MAX_JOB_ATTEMPTS = 5;
 
@@ -18,13 +21,16 @@ export interface TextSender {
 
 export interface ContactManager {
   setContactAssignment(jid: string, assignment: ContactAssignment): Promise<void>;
+  setTyping?: ((jid: string, typing: boolean) => Promise<void>) | undefined;
   renameContact(jid: string, name: string): Promise<void>;
+  getContactAssignment?: ((jid: string) => Promise<ContactAssignment>) | undefined;
+  getStatus?(): Promise<{ connected: boolean }>;
 }
 
 export class QualificationWorker {
   constructor(
     private readonly db: AgentDatabase,
-    private readonly provider: GeminiProvider,
+    private readonly provider: IntakeAIProvider,
     private readonly getAssistant: () => AssistantConfig,
     private readonly runtime: RuntimeConfig,
     private readonly sendText: TextSender,
@@ -37,8 +43,13 @@ export class QualificationWorker {
   }
 
   async run(signal: AbortSignal): Promise<void> {
+    let lastRetentionSweep = 0;
     while (!signal.aborted) {
       try {
+        if (Date.now() - lastRetentionSweep >= 24 * 60 * 60 * 1000) {
+          for (const path of this.db.expireData(this.assistant.retentionDays)) await unlink(path).catch(() => undefined);
+          lastRetentionSweep = Date.now();
+        }
         await this.flushOutbox();
         const job = this.db.claimDueJob();
         if (!job) {
@@ -66,7 +77,7 @@ export class QualificationWorker {
         this.db.deferJob(job.id, error.retryAfterMs, error.message);
         const resumesAt = new Date(Date.now() + error.retryAfterMs).toLocaleString('pt-BR');
         this.db.recordDiagnostic(job.jid, 'aguardando-cota', `Cota gratuita do Gemini atingida; mensagem mantida na fila. Nova tentativa após ${resumesAt}.`);
-        this.logger.warn({ jid: job.jid, jobId: job.id, resumesAt }, 'Gemini quota reached; conversation job deferred');
+        this.logger.warn({ jobId: job.id, resumesAt }, 'Gemini quota reached; conversation job deferred');
         return;
       }
       const failure = safeError(error);
@@ -77,23 +88,14 @@ export class QualificationWorker {
         MAX_JOB_ATTEMPTS,
       );
       this.logger.error(
-        { jid: job.jid, jobId: job.id, attempts: job.attempts, error: failure },
+        { jobId: job.id, attempts: job.attempts, error: failure },
         exhausted ? 'Conversation job exhausted retries' : 'Conversation job will retry',
       );
       this.db.recordDiagnostic(job.jid, 'falha', `Tarefa ${job.id}: ${failure}`);
 
       if (exhausted) {
         const state = this.db.getConversationState(job.jid);
-        state.paused = true;
-        this.db.saveConversationState(job.jid, state);
-        await this.assignContact(job.jid, 'HUMANO', 'processing-failure');
-        await this.deliver(
-          job,
-          job.jid,
-          [this.assistant.handoffMessage],
-          'retry-handoff-client',
-        );
-        await this.notifyHuman(job, job.jid, state, 'Falha repetida no processamento');
+        await this.handoff(job, job.jid, state, this.db.getRecentMessages(job.jid, this.assistant.maxHistoryMessages), 'Falha repetida no processamento');
         this.db.markMessagesProcessed(
           this.db.getUnprocessedMessages(job.jid).map((message) => message.id),
         );
@@ -102,73 +104,90 @@ export class QualificationWorker {
   }
 
   private async startConversation(job: QueueJob): Promise<void> {
-    if (this.db.getContactAssignment(job.jid) !== 'BOT') {
-      this.db.recordDiagnostic(job.jid, 'ignorada', 'Início cancelado: contato saiu da lista Bot - atendimento antes do envio');
+    if (this.db.getUnprocessedMessages(job.jid).length === 0) {
+      this.db.recordDiagnostic(job.jid, 'ignorada', 'A atribuição sozinha não inicia uma mensagem; aguarda-se uma mensagem recebida.');
       return;
     }
-    if (this.db.getUnprocessedMessages(job.jid).length > 0) {
-      this.db.recordDiagnostic(job.jid, 'ignorada', 'Início separado cancelado: há mensagem do contato aguardando processamento');
-      return;
-    }
-    const state = this.db.getConversationState(job.jid);
-    const profile = this.assistant.profiles.find((item) => item.id === state.profileId)
-      ?? this.assistant.profiles.find((item) => item.id === this.assistant.defaultProfileId);
-    if (!profile) throw new Error('Não há fluxo padrão disponível para iniciar a conversa.');
-    state.profileId = profile.id;
-    state.paused = false;
-    state.completed = false;
-
-    const nextPending = profile.fields.find((field) => field.id === state.pendingFieldId)
-      ?? profile.fields.find((field) => !state.fields[field.id] && !state.skippedFields.includes(field.id) && this.shouldAsk(field, state));
-    const firstTurn = this.db.getRecentMessages(job.jid, 1).length === 0 && Object.keys(state.fields).length === 0;
-    const areaUnknown = !state.fields[this.assistant.areaFieldId];
-    const pending = firstTurn && areaUnknown
-      ? profile.fields.find((field) => field.id === this.assistant.areaFieldId) ?? nextPending
-      : nextPending;
-    if (!pending) {
-      this.db.saveConversationState(job.jid, state);
-      this.db.recordDiagnostic(job.jid, 'ignorada', 'Início automático sem envio: não há pergunta pendente neste fluxo');
-      return;
-    }
-    state.pendingFieldId = pending.id;
-    this.db.saveConversationState(job.jid, state);
-    const parts = firstTurn
-      ? [this.assistant.greeting, areaUnknown ? this.assistant.areaQuestion : pending.question]
-      : [pending.question];
-    await this.deliver(job, job.jid, parts, 'qualification-start-' + pending.id);
-    this.db.recordDiagnostic(job.jid, 'processada', 'Saudação e primeira pergunta enviadas após entrada em Bot - atendimento');
+    await this.processConversation(job);
   }
 
   private async processConversation(job: QueueJob): Promise<void> {
-    const incoming = this.db.getUnprocessedMessages(job.jid);
+    let incoming = this.db.getUnprocessedMessages(job.jid);
     if (incoming.length === 0) return;
 
     const state = this.db.getConversationState(job.jid);
-    const assignment = this.db.getContactAssignment(job.jid);
-    if (assignment !== 'BOT') {
-      await this.removeTemporaryMedia(incoming);
-      this.db.markMessagesProcessed(incoming.map((message) => message.id));
-      this.db.recordDiagnostic(job.jid, 'ignorada', `Contato fora da lista Bot - atendimento (atribuição local: ${assignment ?? 'desconhecida'})`);
-      this.logger.info({ jid: job.jid, assignment }, 'Mensagem ignorada: contato fora da lista Bot - atendimento');
+    if (!(await this.isAuthorized(job.jid))) {
+      this.db.recordDiagnostic(job.jid, 'aguardando-autorizacao', 'Mensagem pendente preservada; elegibilidade ou estado do atendimento não autorizou resposta.');
       return;
     }
-    if (this.assistant.newContactsOnly && state.profileId === null && !this.db.isFirstContact(job.jid) && !this.db.hasExplicitBotAssignment(job.jid)) {
-      await this.removeTemporaryMedia(incoming);
-      this.db.markMessagesProcessed(incoming.map((message) => message.id));
-      this.db.recordDiagnostic(job.jid, 'ignorada', 'Regra de somente novos contatos; mova o contato para Bot - atendimento no painel ou WhatsApp para reativar');
-      return;
+    if (state.externalDisclosureAfterMessageId !== null) {
+      const preDisclosure = incoming.filter((message) => message.id <= state.externalDisclosureAfterMessageId!);
+      this.db.markMessagesProcessed(preDisclosure.map((message) => message.id));
+      incoming = incoming.filter((message) => message.id > state.externalDisclosureAfterMessageId!);
+      if (incoming.length === 0) return;
     }
-    if (state.paused) {
-      await this.removeTemporaryMedia(incoming);
+
+    const usesExternalAI = this.assistant.aiProvider === 'gemini' || this.assistant.audioTranscriptionProvider === 'gemini';
+    if (usesExternalAI && state.externalDisclosureAfterMessageId === null) {
+      const initialText = incoming.filter((message) => message.kind === 'text').map((message) => message.body ?? '').join(' ').trim();
+      const historyBeforeDisclosure = this.db.getRecentMessages(job.jid, this.assistant.maxHistoryMessages);
+      if (initialText && this.isHumanCommand(initialText)) {
+        await this.handoff(job, job.jid, state, historyBeforeDisclosure, 'Solicitação de atendimento humano');
+        this.db.markMessagesProcessed(incoming.map((message) => message.id));
+        return;
+      }
+      if (initialText && containsAny(initialText, this.assistant.handoffKeywords)) {
+        await this.deliver(job, job.jid, [this.assistant.urgencyMessage], 'urgency-client');
+        state.paused = true;
+        this.db.saveConversationState(job.jid, state);
+        await this.assignContact(job.jid, 'HUMANO', 'urgency');
+        await this.notifyHuman(job, job.jid, state, 'Palavra de urgência detectada', historyBeforeDisclosure);
+        this.db.markMessagesProcessed(incoming.map((message) => message.id));
+        return;
+      }
+      if (initialText && (containsAny(initialText, this.assistant.legalQuestionKeywords) || containsAny(initialText, this.assistant.forbiddenTopics))) {
+        await this.handoff(job, job.jid, state, historyBeforeDisclosure, 'Dúvida ou tema encaminhado à equipe');
+        this.db.markMessagesProcessed(incoming.map((message) => message.id));
+        return;
+      }
+      await this.deliver(job, job.jid, [this.assistant.externalProviderNotice], 'external-provider-notice');
+      const noticeParts = splitTextDeterministically([this.assistant.externalProviderNotice], this.assistant.maxCharsPerMessage, this.assistant.maxMessagesPerTurn).messages;
+      const noticeDelivered = noticeParts.length > 0 && noticeParts.every((_, index) =>
+        this.db.getOutboundStatus(job.id + ':external-provider-notice:' + index) === 'sent');
+      if (!noticeDelivered) {
+        this.db.recordDiagnostic(job.jid, 'aviso-provedor-externo-pendente', 'O aviso de processamento externo ainda não teve envio confirmado; o conteúdo permanece fora da IA externa.');
+        return;
+      }
+      state.externalDisclosureAfterMessageId = Math.max(...incoming.map((message) => message.id));
+      this.db.saveConversationState(job.jid, state);
+      const discardedMedia = this.db.clearMessageMedia(incoming.map((message) => message.id));
+      await Promise.all(discardedMedia.map((path) => unlink(path).catch(() => undefined)));
       this.db.markMessagesProcessed(incoming.map((message) => message.id));
-      this.db.recordDiagnostic(job.jid, 'ignorada', 'Conversa pausada; mova o contato para a lista Bot - atendimento para reativar');
-      this.logger.info({ jid: job.jid }, 'Mensagem ignorada: conversa fora da lista Bot - atendimento');
+      this.db.recordDiagnostic(job.jid, 'aviso-provedor-externo', 'A primeira mensagem foi excluída do processamento externo; o aviso foi enviado antes de usar o Gemini.');
+      if (state.profileId === null && state.pendingFieldId === null && Object.keys(state.fields).length === 0) {
+        const initialProfile = this.chooseProfile(initialText, state);
+        const initialField = initialProfile.fields.find((field) => field.id === this.assistant.areaFieldId && this.shouldAsk(field, state))
+          ?? initialProfile.fields.find((field) => field.required && this.shouldAsk(field, state));
+        if (initialField) {
+          state.profileId = initialProfile.id;
+          state.pendingFieldId = initialField.id;
+          this.db.saveConversationState(job.jid, state);
+          const opening = [this.assistant.greeting, this.assistant.assistantNotice, this.assistant.privacyNotice].filter(Boolean).join(' ');
+          const question = initialField.id === this.assistant.areaFieldId ? this.assistant.areaQuestion : initialField.question;
+          await this.deliver(job, job.jid, [opening, question], 'post-external-notice-' + initialField.id);
+        }
+      }
       return;
     }
 
     let audioFailed = false;
     for (const message of incoming) {
       if (message.kind !== 'audio') continue;
+      if (this.assistant.audioTranscriptionProvider === 'disabled') {
+        audioFailed = true;
+        if (message.mediaPath) await unlink(message.mediaPath).catch(() => undefined);
+        continue;
+      }
       if (!message.mediaPath) {
         audioFailed = true;
         continue;
@@ -196,20 +215,18 @@ export class QualificationWorker {
     }
 
     if (audioFailed) {
-      await this.deliver(
-        job,
-        job.jid,
-        [this.assistant.audioRetryMessage],
-        'audio-retry',
-      );
+      await this.handoff(job, job.jid, state, this.db.getRecentMessages(job.jid, this.assistant.maxHistoryMessages), 'Áudio sem transcrição disponível ou compreensível', this.assistant.audioRetryMessage);
       this.db.markMessagesProcessed(incoming.map((message) => message.id));
       return;
     }
 
-    const history = this.db.getRecentMessages(
+    const recentHistory = this.db.getRecentMessages(
       job.jid,
       this.assistant.maxHistoryMessages,
     );
+    const history = usesExternalAI && state.externalDisclosureAfterMessageId !== null
+      ? recentHistory.filter((message) => message.direction === 'outbound' || message.id > state.externalDisclosureAfterMessageId!)
+      : recentHistory;
     const userText = incoming
       .map((message) => message.body ?? '')
       .join(' ')
@@ -236,6 +253,12 @@ export class QualificationWorker {
       return;
     }
 
+    if (containsAny(userText, this.assistant.legalQuestionKeywords) || containsAny(userText, this.assistant.forbiddenTopics)) {
+      await this.handoff(job, job.jid, state, history, 'Dúvida ou tema encaminhado à equipe');
+      this.db.markMessagesProcessed(incoming.map((message) => message.id));
+      return;
+    }
+
     const previousProfileId = state.profileId;
     const profile = this.chooseProfile(userText, state);
     const switchingProfile = previousProfileId !== null && previousProfileId !== profile.id;
@@ -253,18 +276,37 @@ export class QualificationWorker {
       state.pendingFieldId === null &&
       Object.keys(state.fields).length === 0;
     state.profileId = profile.id;
-    const extraction = await this.provider.extract(
-      profile,
-      history,
-      state.fields,
-      this.assistant,
-    );
-    if (this.db.getContactAssignment(job.jid) !== 'BOT') {
-      await this.removeTemporaryMedia(incoming);
+    let extraction;
+    try {
+      extraction = await this.provider.extract(profile, history, state.fields, this.assistant);
+    } catch (error) {
+      if (error instanceof GeminiQuotaError) throw error;
+      this.db.recordDiagnostic(job.jid, 'falha-ia', 'A extração não foi validada; triagem encaminhada à equipe sem gerar resposta livre.');
+      await this.handoff(job, job.jid, state, history, 'Falha ou baixa confiança na extração automática', this.assistant.aiFallbackMessage);
       this.db.markMessagesProcessed(incoming.map((message) => message.id));
-      this.db.recordDiagnostic(job.jid, 'ignorada', 'A atribuição mudou durante o processamento');
       return;
     }
+    if (!(await this.isAuthorized(job.jid))) {
+      this.db.recordDiagnostic(job.jid, 'aguardando-autorizacao', 'A autorização mudou durante a extração; a mensagem permanece pendente.');
+      return;
+    }
+    const askedFieldId = state.pendingFieldId;
+    const capturedAskedField = askedFieldId ? extraction.capturedFields[askedFieldId] : undefined;
+    if (askedFieldId && !capturedAskedField) {
+      const attempts = (state.attempts[askedFieldId] ?? 0) + 1;
+      state.attempts[askedFieldId] = attempts;
+      const askedField = profile.fields.find((field) => field.id === askedFieldId);
+      if (attempts >= this.assistant.maxFieldAttempts || !askedField) {
+        await this.handoff(job, job.jid, state, history, 'Resposta não compreendida após as tentativas configuradas');
+      } else {
+        state.pendingFieldId = askedField.id;
+        this.db.saveConversationState(job.jid, state);
+        await this.deliver(job, job.jid, [this.assistant.clarificationMessage, askedField.question], 'clarification-' + askedField.id);
+      }
+      this.db.markMessagesProcessed(incoming.map((message) => message.id));
+      return;
+    }
+    if (askedFieldId) delete state.attempts[askedFieldId];
     state.fields = { ...state.fields, ...extraction.capturedFields };
     const nameField = profile.fields.find((field) => field.contactName);
     const capturedName = nameField && state.pendingFieldId === nameField.id
@@ -304,17 +346,17 @@ export class QualificationWorker {
     }
 
     if (!nextField) {
-      state.pendingFieldId = null;
-      state.completed = true;
-      state.paused = true;
-      this.db.saveConversationState(job.jid, state);
-      await this.assignContact(job.jid, 'HUMANO', 'completion');
       await this.deliver(
         job,
         job.jid,
         [this.assistant.completionMessage],
         'completion-client',
       );
+      state.pendingFieldId = null;
+      state.completed = true;
+      state.paused = true;
+      this.db.saveConversationState(job.jid, state);
+      await this.assignContact(job.jid, 'HUMANO', 'completion');
       await this.notifyHuman(job, job.jid, state, 'Triagem concluída');
     } else {
       const areaUnknown = firstTurn && !state.fields[this.assistant.areaFieldId];
@@ -324,14 +366,15 @@ export class QualificationWorker {
       state.pendingFieldId = askedField.id;
       this.db.saveConversationState(job.jid, state);
       const parts = firstTurn
-        ? [this.assistant.greeting, areaUnknown ? this.assistant.areaQuestion : nextField.question]
-        : [extraction.acknowledgement, nextField.question].filter(
-            (part): part is string => Boolean(part),
-          );
+        ? [
+            [this.assistant.greeting, this.assistant.assistantNotice, this.assistant.privacyNotice].filter(Boolean).join(' '),
+            areaUnknown ? this.assistant.areaQuestion : nextField.question,
+          ]
+        : [this.assistant.acknowledgementMessage, nextField.question];
       await this.deliver(
         job,
         job.jid,
-        parts.slice(0, this.assistant.maxMessagesPerTurn),
+        parts,
         'qualification-' + nextField.id,
       );
     }
@@ -366,11 +409,12 @@ export class QualificationWorker {
     state: ConversationState,
     history: StoredMessage[],
     reason: string,
+    clientMessage = this.assistant.handoffMessage,
   ): Promise<void> {
+    await this.deliver(job, jid, [clientMessage], 'handoff-client');
     state.paused = true;
     this.db.saveConversationState(jid, state);
     await this.assignContact(jid, 'HUMANO', 'handoff');
-    await this.deliver(job, jid, [this.assistant.handoffMessage], 'handoff-client');
     await this.notifyHuman(job, jid, state, reason, history);
   }
 
@@ -384,10 +428,13 @@ export class QualificationWorker {
       this.assistant.maxHistoryMessages,
     ),
   ): Promise<void> {
+    if (this.runtime.whatsappProvider === 'meta') {
+      this.db.recordDiagnostic(clientJid, 'encaminhamento-interno', `Provedor Meta: ${reason}. A equipe deve abrir a conversa no canal Business; nenhum resumo foi enviado por WhatsApp.`);
+      return;
+    }
     const target = this.runtime.humanNotifyJid;
     if (!target) {
       this.logger.warn(
-        { jid: clientJid },
         'Set HUMAN_NOTIFY_JID to deliver handoff summaries to the team',
       );
       return;
@@ -423,12 +470,30 @@ export class QualificationWorker {
   private async assignContact(jid: string, assignment: ContactAssignment, source: string): Promise<void> {
     try {
       await this.contacts.setContactAssignment(jid, assignment);
-    } catch (error) {
-      const message = safeError(error);
-      this.logger.warn({ jid, assignment, error: message }, 'Atribuição local aplicada; falha ao sincronizar lista do WhatsApp');
-      this.db.recordDiagnostic(jid, 'falha-lista', message);
+    } catch {
+      this.logger.warn({ assignment }, 'Falha ao sincronizar a atribuição com o WhatsApp; o estado local mantém a automação bloqueada.');
+      this.db.recordDiagnostic(jid, 'falha-lista', 'Falha ao sincronizar a atribuição com o WhatsApp.');
+      this.db.blockAutomation(jid, 'system-assignment-sync', assignment);
+      return;
     }
     this.db.setContactAssignment(jid, assignment, source);
+  }
+
+  private async isAuthorized(jid: string): Promise<boolean> {
+    if (!this.db.isAuthorizedForAutomation(jid)) return false;
+    try {
+      if (this.contacts.getStatus && !(await this.contacts.getStatus()).connected) return false;
+      if (this.contacts.getContactAssignment) {
+        const remote = await this.contacts.getContactAssignment(jid);
+        const local = this.db.syncRemoteAssignment(jid, remote);
+        if (local !== 'BOT') return false;
+      }
+      return this.db.isAuthorizedForAutomation(jid);
+    } catch {
+      this.db.recordDiagnostic(jid, 'falha-sincronizacao', 'Não foi possível confirmar a elegibilidade no WhatsApp; envio bloqueado.');
+      this.logger.warn('Não foi possível confirmar a elegibilidade no WhatsApp; envio bloqueado.');
+      return false;
+    }
   }
 
   private missingFields(state: ConversationState): string[] {
@@ -462,43 +527,126 @@ export class QualificationWorker {
     parts: string[],
     suffix: string,
   ): Promise<void> {
-    const messages = parts.filter((part) => part.trim().length > 0);
-    const maxMessages = this.assistant.maxMessagesPerTurn;
-    const selected = messages.length <= maxMessages
-      ? messages
-      : [...messages.slice(0, maxMessages - 1), messages.slice(maxMessages - 1).join('\n\n')];
+    const split = splitTextDeterministically(parts, this.assistant.maxCharsPerMessage, this.assistant.maxMessagesPerTurn);
+    const selected = split.messages;
+    if (split.truncated) this.db.recordDiagnostic(jid, 'resposta-limitada', 'O texto configurado excedeu os limites de balões; partes excedentes foram omitidas.');
+    const authorizationRequired = jid !== this.runtime.humanNotifyJid;
+    if (!selected.length) return;
     for (let index = 0; index < selected.length; index += 1) {
-      if (suffix.startsWith('qualification-') && this.db.getContactAssignment(jid) !== 'BOT') {
-        this.db.recordDiagnostic(jid, 'ignorada', 'A atribuição mudou antes do envio');
+      if (authorizationRequired && !(await this.isAuthorized(jid))) {
+        this.db.recordDiagnostic(jid, 'envio-bloqueado', 'A autorização não está confirmada antes do envio.');
         return;
-      }
-      if (index > 0 && this.assistant.sendPartDelaySeconds > 0) {
-        await delaySeconds(this.assistant.sendPartDelaySeconds);
       }
       const id = this.db.queueOutbound(
         job.id + ':' + suffix + ':' + index,
         jid,
         selected[index]!,
+        authorizationRequired,
       );
       if (this.db.isOutboundSent(id)) continue;
-      await this.sendText(jid, selected[index]!);
-      this.db.markOutboundSent(id);
-      this.db.recordDiagnostic(jid, 'respondida', `Mensagem ${index + 1}/${selected.length}`);
+      if (index > 0) {
+        const delay = Math.max(this.assistant.sendPartDelaySeconds, this.assistant.minSecondsBetweenContactMessages);
+        if (delay > 0) await delaySeconds(delay);
+      }
+      if (authorizationRequired && !(await this.isAuthorized(jid))) {
+        this.db.markOutboundBlocked(id, 'A autorização mudou antes do envio.');
+        this.db.recordDiagnostic(jid, 'envio-bloqueado', 'A autorização mudou antes do próximo balão.');
+        return;
+      }
+      await this.sendOutboxItem({ id, jid, body: selected[index]!, authorizationRequired, attempts: 0 });
     }
   }
 
   private async flushOutbox(): Promise<void> {
     for (const item of this.db.pendingOutbox()) {
-      await this.sendText(item.jid, item.body);
-      this.db.markOutboundSent(item.id);
+      if (item.authorizationRequired && !(await this.isAuthorized(item.jid))) {
+        this.db.markOutboundBlocked(item.id, 'Elegibilidade não confirmada na retomada da fila.');
+        this.db.recordDiagnostic(item.jid, 'envio-bloqueado', 'Uma mensagem pendente foi bloqueada após mudança de autorização.');
+        continue;
+      }
+      await this.sendOutboxItem(item);
     }
   }
 
-  private async removeTemporaryMedia(messages: StoredMessage[]): Promise<void> {
-    for (const message of messages) {
-      if (message.mediaPath) await unlink(message.mediaPath).catch(() => undefined);
+  private async sendOutboxItem(item: { id: number; jid: string; body: string; authorizationRequired: boolean; attempts?: number }): Promise<void> {
+    if (item.authorizationRequired && !(await this.isAuthorized(item.jid))) {
+      this.db.markOutboundBlocked(item.id, 'Elegibilidade não confirmada antes do envio.');
+      return;
+    }
+    if ((item.attempts ?? 0) >= MAX_JOB_ATTEMPTS) {
+      this.db.markOutboundBlocked(item.id, 'Limite de tentativas do envio atingido.');
+      if (item.authorizationRequired) this.db.blockAutomation(item.jid, 'system-send-retries');
+      this.db.recordDiagnostic(item.jid, 'fila-falha', 'Envio bloqueado após o limite de tentativas; requer revisão humana.');
+      return;
+    }
+    const rateLimit = this.db.outboundLimitReason(item.jid, this.outboundRateLimits(), item.authorizationRequired, item.id);
+    if (rateLimit) {
+      this.db.markOutboundBlocked(item.id, rateLimit);
+      if (item.authorizationRequired) this.db.blockAutomation(item.jid, 'system-rate-limit');
+      this.db.recordDiagnostic(item.jid, 'limite-envio', rateLimit + ' A automação foi pausada para revisão.');
+      return;
+    }
+    await this.prepareTyping(item);
+    if (item.authorizationRequired && !(await this.isAuthorized(item.jid))) {
+      this.db.markOutboundBlocked(item.id, 'A autorização mudou durante a presença de digitação.');
+      this.db.recordDiagnostic(item.jid, 'envio-bloqueado', 'A autorização mudou antes de confirmar o envio.');
+      return;
+    }
+    this.db.markOutboundSending(item.id);
+    try {
+      await this.sendText(item.jid, item.body);
+      this.db.markOutboundSent(item.id);
+      this.db.recordDiagnostic(item.jid, 'respondida', 'Mensagem aceita pelo provedor WhatsApp.');
+    } catch (error) {
+      if (error instanceof SendOutcomeUnknownError) {
+        this.db.markOutboundUnknown(item.id, 'O provedor não confirmou o resultado do envio.');
+        if (item.authorizationRequired) this.db.blockAutomation(item.jid, 'system-unknown-send');
+        this.db.recordDiagnostic(item.jid, 'envio-incerto', 'Resultado do envio desconhecido; não haverá repetição automática. Revisão humana necessária.');
+        return;
+      }
+      if (error instanceof ProviderRetryAfterError) {
+        this.db.retryOutbound(item.id, error.retryAfterMs, 'O provedor limitou a taxa de envio.');
+        this.db.recordDiagnostic(item.jid, 'envio-adiado', 'O provedor limitou a taxa; a mensagem permanece na fila.');
+        return;
+      }
+      const nextAttempt = (item.attempts ?? 0) + 1;
+      if (nextAttempt >= MAX_JOB_ATTEMPTS) {
+        this.db.markOutboundBlocked(item.id, 'Falha confirmada após o limite de tentativas.');
+        if (item.authorizationRequired) this.db.blockAutomation(item.jid, 'system-send-retries');
+        this.db.recordDiagnostic(item.jid, 'fila-falha', 'Envio bloqueado após falha confirmada; revisão humana necessária.');
+        return;
+      }
+      this.db.retryOutbound(item.id, Math.min(60_000, 1_000 * 2 ** nextAttempt), safeError(error));
+      this.db.recordDiagnostic(item.jid, 'envio-adiado', 'Falha confirmada; nova tentativa limitada foi agendada.');
     }
   }
+
+  private outboundRateLimits(): OutboundRateLimits {
+    return {
+      perContactDay: this.assistant.maxMessagesPerContactPerDay,
+      perContactMonth: this.assistant.maxMessagesPerContactPerMonth,
+      globalDay: this.assistant.maxMessagesSentPerDay,
+      globalMonth: this.assistant.maxMessagesSentPerMonth,
+      minSecondsBetweenContactMessages: this.assistant.minSecondsBetweenContactMessages,
+    };
+  }
+
+  private async prepareTyping(item: { jid: string; body: string; authorizationRequired: boolean }): Promise<void> {
+    if (!item.authorizationRequired || !this.assistant.simulateTyping || !this.contacts.setTyping) return;
+    if (!(await this.isAuthorized(item.jid))) return;
+    let started = false;
+    try {
+      await this.contacts.setTyping(item.jid, true);
+      started = true;
+      const durationSeconds = Math.min(30, item.body.length * this.assistant.typingSecondsPerCharacter);
+      if (durationSeconds > 0) await delaySeconds(durationSeconds);
+    } catch (error) {
+      this.logger.warn({ error: safeError(error) }, 'Falha ao atualizar presença de digitação; o envio seguirá após nova validação de autorização.');
+    } finally {
+      if (started) await this.contacts.setTyping(item.jid, false).catch(() => undefined);
+    }
+  }
+
 }
 
 function containsAny(text: string, keywords: string[]): boolean {
@@ -515,7 +663,51 @@ function normalize(value: string): string {
 }
 
 function safeError(error: unknown): string {
-  return error instanceof Error ? error.message : 'Unknown processing error';
+  return error instanceof Error ? error.name : 'UnknownError';
+}
+
+export function splitTextDeterministically(parts: string[], maxChars: number, maxMessages: number): { messages: string[]; truncated: boolean } {
+  const nonEmpty = parts.map((part) => part.trim()).filter(Boolean);
+  const chunks = nonEmpty.map((part) => splitPart(part, maxChars));
+  const flattened = chunks.flat();
+  if (flattened.length <= maxMessages) return { messages: flattened, truncated: false };
+
+  const finalChunks = chunks.at(-1) ?? [];
+  const prefixChunks = chunks.slice(0, -1).flat();
+  if (finalChunks.length >= maxMessages) {
+    return { messages: finalChunks.slice(0, maxMessages), truncated: true };
+  }
+  const prefixCount = maxMessages - finalChunks.length;
+  return { messages: [...prefixChunks.slice(0, prefixCount), ...finalChunks], truncated: true };
+}
+
+function splitPart(text: string, maxChars: number): string[] {
+  const sentences = text.match(/[^.!?]+[.!?]+|[^.!?]+$/g) ?? [text];
+  const result: string[] = [];
+  let current = '';
+  for (const rawSentence of sentences) {
+    const sentence = rawSentence.trim();
+    if (!sentence) continue;
+    if (sentence.length > maxChars) {
+      if (current) { result.push(current); current = ''; }
+      let rest = sentence;
+      while (rest.length > maxChars) {
+        let cut = rest.lastIndexOf(' ', maxChars);
+        if (cut < 1) cut = maxChars;
+        result.push(rest.slice(0, cut).trim());
+        rest = rest.slice(cut).trim();
+      }
+      if (rest) result.push(rest);
+      continue;
+    }
+    const candidate = current ? `${current} ${sentence}` : sentence;
+    if (candidate.length > maxChars) {
+      result.push(current);
+      current = sentence;
+    } else current = candidate;
+  }
+  if (current) result.push(current);
+  return result;
 }
 
 function delay(milliseconds: number, signal?: AbortSignal): Promise<void> {
