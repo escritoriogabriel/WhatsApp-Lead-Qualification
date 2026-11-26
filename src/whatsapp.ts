@@ -179,6 +179,9 @@ export async function connectWhatsApp(
       logger,
       printQRInTerminal: false,
       syncFullHistory: false,
+      // The default init queries fetch unrelated profile/privacy props and can
+      // time out; label authorization is handled by our explicit app-state sync.
+      fireInitQueries: false,
       markOnlineOnConnect: false,
       shouldSyncHistoryMessage: () => false,
       browser: ['Windows', 'Chrome', '10.0.0'],
