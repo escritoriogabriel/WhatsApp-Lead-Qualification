@@ -4,11 +4,12 @@ import { join } from 'node:path';
 import type { Logger } from 'pino';
 import { ProviderRetryAfterError, SendOutcomeUnknownError } from './provider-errors.js';
 import type { RuntimeConfig } from './config.js';
-import type { ContactAssignment, IncomingMessage } from './database.js';
+import type { IncomingMessage } from './database.js';
 import type {
   WhatsAppCallbacks,
   WhatsAppConnection,
   WhatsAppLabel,
+  WhatsAppLabelTarget,
   WhatsAppStatus,
 } from './whatsapp.js';
 
@@ -23,7 +24,7 @@ const WEBHOOK_EVENTS = [
   'label.chat.added',
   'label.chat.deleted',
 ];
-const APP_LABELS = ['Novo Lead', 'Bot - atendimento', 'Atendimento'];
+const APP_LABELS = ['Novo Lead', 'Bot - atendimento', 'Atendimento', 'Clientes'];
 const LEGACY_LABELS = [...APP_LABELS, 'BOT', 'HUMANO'];
 const AUDIO_EXTENSIONS: Record<string, string> = {
   'audio/aac': '.aac',
@@ -138,8 +139,8 @@ class WahaAdapter {
     return {
       sendText: (jid, text) => this.sendText(jid, text),
       setTyping: (jid, typing) => this.setTyping(jid, typing),
-      setContactAssignment: (jid, assignment) => this.setContactAssignment(jid, assignment),
-      getContactAssignment: (jid) => this.getContactAssignment(jid),
+      setContactLabels: (jid, target) => this.setContactLabels(jid, target),
+      getContactLabelNames: (jid) => this.getContactLabelNames(jid),
       renameContact: (jid, name) => this.renameContact(jid, name),
       getStatus: () => this.getStatus(),
       getQrPng: () => this.getQrPng(),
@@ -242,20 +243,27 @@ class WahaAdapter {
     });
   }
 
-  private async setContactAssignment(jid: string, assignment: ContactAssignment): Promise<void> {
-    const targetName = assignment === 'BOT' ? 'Bot - atendimento' : assignment === 'HUMANO' ? 'Atendimento' : 'Novo Lead';
+  private async setContactLabels(jid: string, target: WhatsAppLabelTarget): Promise<void> {
+    const targetName = target === 'BOT' ? 'Bot - atendimento' : 'Atendimento';
     let labels = await this.getLabels();
-    let target = labels.find((label) => label.name.trim().toLocaleLowerCase('pt-BR') === targetName.toLocaleLowerCase('pt-BR'));
-    if (!target) {
-      const color = targetName === 'Novo Lead' ? 7 : targetName === 'Bot - atendimento' ? 4 : 2;
+    const requiredNames = target === 'BOT' ? ['Novo Lead', targetName] : [targetName];
+    for (const requiredName of requiredNames) {
+      if (labels.some((label) => label.name.trim().toLocaleLowerCase('pt-BR') === requiredName.toLocaleLowerCase('pt-BR'))) continue;
+      const color = requiredName === 'Novo Lead' ? 7 : requiredName === 'Bot - atendimento' ? 4 : 2;
+      await this.requestJson(`/api/${encodeURIComponent(this.sessionName)}/labels`, { method: 'POST', body: JSON.stringify({ name: requiredName, color }) });
+      labels = await this.getLabels();
+    }
+    let targetLabel = labels.find((label) => label.name.trim().toLocaleLowerCase('pt-BR') === targetName.toLocaleLowerCase('pt-BR'));
+    if (!targetLabel) {
+      const color = target === 'BOT' ? 4 : 2;
       await this.requestJson(`/api/${encodeURIComponent(this.sessionName)}/labels`, {
         method: 'POST',
         body: JSON.stringify({ name: targetName, color }),
       });
       labels = await this.getLabels();
-      target = labels.find((label) => label.name.trim().toLocaleLowerCase('pt-BR') === targetName.toLocaleLowerCase('pt-BR'));
+      targetLabel = labels.find((label) => label.name.trim().toLocaleLowerCase('pt-BR') === targetName.toLocaleLowerCase('pt-BR'));
     }
-    if (!target) throw new Error(`Não foi possível criar ou localizar a etiqueta "${targetName}" no WAHA.`);
+    if (!targetLabel) throw new Error(`Não foi possível criar ou localizar a etiqueta "${targetName}" no WAHA.`);
 
     const chatId = toWahaChatId(jid);
     const chatPath = `/api/${encodeURIComponent(this.sessionName)}/labels/chats/${encodeURIComponent(chatId)}/`;
@@ -265,23 +273,21 @@ class WahaAdapter {
       labels.filter((label) => LEGACY_LABELS.some((name) => name.toLocaleLowerCase('pt-BR') === label.name.trim().toLocaleLowerCase('pt-BR'))).map((label) => label.id),
     );
     const preserved = current.filter((label) => !managedIds.has(label.id)).map((label) => label.id);
-    const nextIds = [...new Set([...preserved, target.id])];
+    const newLead = target === 'BOT' ? labels.find((label) => label.name.trim().toLocaleLowerCase('pt-BR') === 'novo lead') : undefined;
+    const clientLabel = labels.find((label) => label.name.trim().toLocaleLowerCase('pt-BR') === 'clientes');
+    const keepClient = clientLabel && current.some((label) => label.id === clientLabel.id);
+    if (target === 'BOT' && keepClient) throw new Error('Contato está na lista Clientes; remova essa etiqueta antes de ativar o bot.');
+    const nextIds = [...new Set([...preserved, targetLabel.id, ...(newLead ? [newLead.id] : []), ...(keepClient ? [clientLabel.id] : [])])];
     await this.requestJson(chatPath, {
       method: 'PUT',
       body: JSON.stringify({ labels: nextIds.map((id) => ({ id })) }),
     });
   }
 
-  private async getContactAssignment(jid: string): Promise<ContactAssignment> {
+  private async getContactLabelNames(jid: string): Promise<string[]> {
     const labels = await this.getLabels();
-    const current = extractLabels(await this.requestJson(
-      `/api/${encodeURIComponent(this.sessionName)}/labels/chats/${encodeURIComponent(toWahaChatId(jid))}/`,
-    ));
-    const names = current.map((label) => label.name || labels.find((candidate) => candidate.id === label.id)?.name || '')
-      .map((name) => name.trim().toLocaleLowerCase('pt-BR'));
-    if (names.some((name) => name === 'atendimento' || name === 'humano')) return 'HUMANO';
-    if (names.includes('bot - atendimento')) return 'BOT';
-    return 'PAUSADO';
+    const current = extractLabels(await this.requestJson(`/api/${encodeURIComponent(this.sessionName)}/labels/chats/${encodeURIComponent(toWahaChatId(jid))}/`));
+    return current.map((label) => label.name || labels.find((candidate) => candidate.id === label.id)?.name || '').filter(Boolean);
   }
 
   private async getLabels(): Promise<RemoteLabel[]> {

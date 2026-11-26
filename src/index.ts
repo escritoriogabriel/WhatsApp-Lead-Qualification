@@ -6,6 +6,7 @@ import { loadRuntimeConfig, type RuntimeConfig } from './config.js';
 import { AgentDatabase } from './database.js';
 import { RoutedAIProvider } from './ai-router.js';
 import { connectMetaCloudApi } from './meta.js';
+import { ensureNewLeadLists } from './lead-labels.js';
 import { QualificationWorker, type ContactManager } from './qualification.js';
 import { connectWaha } from './waha.js';
 import {
@@ -55,22 +56,45 @@ async function main(): Promise<void> {
       if (message.mediaPath) await unlink(message.mediaPath).catch(() => undefined);
       return;
     }
-    if (firstContactObserved && runtime.assistant.firstMessagePolicy === 'auto' &&
-      db.getContactAssignment(message.jid) === 'PAUSADO' && !db.isManualPause(message.jid)) {
+    if (firstContactObserved) db.markLabelInitializationPending(message.jid);
+    if (firstContactObserved || db.needsLabelInitialization(message.jid)) {
       try {
-        if (!whatsapp) throw new Error('WhatsApp ainda está inicializando.');
-        await whatsapp.setContactAssignment(message.jid, 'BOT');
-        db.setContactAssignment(message.jid, 'BOT', 'new-lead');
-        db.recordDiagnostic(message.jid, 'autorizacao', 'Primeira mensagem observada; triagem iniciada pela política configurada.');
-        db.queueConversationStart(message.jid);
+        await initializeLeadLists(message.jid);
       } catch (error) {
-        db.setContactAssignment(message.jid, 'PAUSADO', 'new-lead-list-failed');
-        db.recordDiagnostic(message.jid, 'falha-lista', 'Não foi possível confirmar a elegibilidade no provedor; a mensagem permanece pendente.');
-        logger.error('Falha ao confirmar elegibilidade para primeira resposta; mensagem mantida pendente.');
+        db.recordDiagnostic(message.jid, 'falha-lista', 'Não foi possível consultar ou atualizar as listas do WhatsApp; a mensagem permanece pendente.');
+        logger.error('Falha ao confirmar as listas do WhatsApp; mensagem mantida pendente.');
       }
     }
     if (firstContactObserved) db.recordDiagnostic(message.jid, 'primeiro-contato-observado', 'Primeiro contato observado pelo sistema; isso não indica histórico anterior com o escritório.');
     logger.info({ kind: message.kind }, 'Mensagem recebida e colocada na fila');
+  };
+
+  const initializeLeadLists = async (jid: string): Promise<void> => {
+    if (!whatsapp) throw new Error('WhatsApp ainda está inicializando.');
+    if (!whatsapp.getContactLabelNames) throw new Error('O provedor não consulta as listas do contato.');
+    const result = await ensureNewLeadLists(await whatsapp.getContactLabelNames(jid), async () => {
+      await whatsapp!.setContactLabels(jid, 'BOT');
+    });
+    if (result === 'blocked-by-clients') {
+      db.recordDiagnostic(jid, 'bloqueada-clientes', 'Contato está na lista Clientes; as respostas continuam bloqueadas.');
+      return;
+    }
+    if (result === 'lists-added') {
+      db.recordDiagnostic(jid, 'novo-lead', 'Contato fora da lista Clientes; adicionadas as listas Novo Lead e Bot - atendimento.');
+    }
+    db.clearLabelInitializationPending(jid);
+    db.queueConversationStart(jid);
+  };
+
+  const initializePendingLeads = async (): Promise<void> => {
+    for (const jid of db.getContactsAwaitingLabelInitialization()) {
+      try {
+        await initializeLeadLists(jid);
+      } catch {
+        db.recordDiagnostic(jid, 'falha-lista', 'A sincronização inicial terminou, mas não foi possível confirmar ou atualizar as listas; a mensagem permanece pendente.');
+      }
+    }
+    for (const jid of db.getContactsWithUnprocessedMessages()) db.queueConversationStart(jid);
   };
 
   const onLabelEdit: WhatsAppCallbacks['onLabelEdit'] = (label) => {
@@ -81,9 +105,11 @@ async function main(): Promise<void> {
   const onLabelAssociation: WhatsAppCallbacks['onLabelAssociation'] = (association: WhatsAppLabelAssociation, add) => {
     if (association.chatId.endsWith('@g.us')) return;
     const name = db.getLabelName(association.labelId) ?? association.labelId;
-    db.updateContactLabel(association.chatId, association.labelId, name, add);
-    const currentAssignment = db.getContactAssignment(association.chatId);
-    if (currentAssignment === 'BOT') db.queueConversationStart(association.chatId);
+    const transition = db.updateContactLabel(association.chatId, association.labelId, name, add);
+    if (name.trim().toLocaleLowerCase('pt-BR') === 'clientes' && !add) {
+      db.markLabelInitializationPending(association.chatId);
+    }
+    if (transition.authorized) db.queueConversationStart(association.chatId);
   };
 
   const callbacks: WhatsAppCallbacks = {
@@ -91,19 +117,19 @@ async function main(): Promise<void> {
     onLabelEdit,
     onLabelAssociation,
     getLabelId: (name) => db.getLabelIdByName(name),
+    getContactLabelNames: (jid) => db.getContactLabelNames(jid),
+    onLabelsReady: initializePendingLeads,
   };
   const openWhatsAppProvider = async (provider: RuntimeConfig['whatsappProvider']): Promise<WhatsAppConnection> => {
     if (provider === 'waha') return connectWaha(runtime, logger, callbacks);
-    if (provider === 'meta') return connectMetaCloudApi(runtime, logger, callbacks);
-    return connectWhatsApp(runtime, logger, callbacks.onIncoming, callbacks.onLabelEdit, callbacks.onLabelAssociation, callbacks.getLabelId);
+    if (provider === 'meta') throw new Error('Meta Cloud API não expõe as listas nativas exigidas por esta operação. Selecione WAHA ou Baileys.');
+    return connectWhatsApp(runtime, logger, callbacks.onIncoming, callbacks.onLabelEdit, callbacks.onLabelAssociation, callbacks.getLabelId, callbacks.getContactLabelNames, callbacks.onLabelsReady);
   };
   const ensureProviderCredentials = (provider: RuntimeConfig['whatsappProvider']): void => {
     if (provider === 'waha' && (!runtime.wahaApiKey || !runtime.wahaWebhookSecret)) {
       throw new Error('WAHA_API_KEY e WAHA_WEBHOOK_SECRET são obrigatórios para usar WAHA.');
     }
-    if (provider === 'meta' && (!runtime.metaAccessToken || !runtime.metaPhoneNumberId || !runtime.metaAppSecret || !runtime.metaWebhookVerifyToken)) {
-      throw new Error('Configure as quatro credenciais META_* necessárias antes de selecionar a Meta Cloud API.');
-    }
+    if (provider === 'meta') throw new Error('Meta Cloud API não oferece sincronização com as listas nativas deste fluxo. Use WAHA ou Baileys.');
   };
   const changeWhatsAppProvider = async (provider: RuntimeConfig['whatsappProvider']): Promise<void> => {
     ensureProviderCredentials(provider);
@@ -142,16 +168,13 @@ async function main(): Promise<void> {
     port: Number(process.env.PANEL_PORT ?? 3000),
     password: process.env.PANEL_PASSWORD ?? '',
     getConfig: () => runtime.assistant,
+    getAiModels: () => ({ ollama: runtime.ollamaModel, gemini: runtime.geminiModel }),
     setConfig: async (assistant) => {
       await changeWhatsAppProvider(assistant.whatsappProvider);
       runtime.assistant = assistant;
       db.setBatchWindowMs(assistant.batchWindowSeconds * 1000);
     },
     database: db,
-    setContactAssignment: async (jid, assignment) => {
-      if (!whatsapp) throw new Error('WhatsApp ainda está conectando. Tente novamente em instantes.');
-      await whatsapp.setContactAssignment(jid, assignment);
-    },
     getWhatsAppStatus,
     getWhatsAppQr: async () => whatsapp?.getQrPng ? whatsapp.getQrPng() : null,
     restartWhatsApp: async () => {
@@ -188,9 +211,9 @@ async function main(): Promise<void> {
       await whatsapp.sendText(jid, text);
     },
     {
-      setContactAssignment: async (jid, assignment) => {
+      setContactLabels: async (jid, target) => {
         if (!whatsapp) throw new Error('Provedor WhatsApp está sendo alterado.');
-        await whatsapp.setContactAssignment(jid, assignment);
+        await whatsapp.setContactLabels(jid, target);
       },
       renameContact: async (jid, name) => {
         if (!whatsapp) throw new Error('Provedor WhatsApp está sendo alterado.');
@@ -200,9 +223,9 @@ async function main(): Promise<void> {
         if (!whatsapp) return { connected: false };
         return { connected: (await whatsapp.getStatus?.())?.connected ?? false };
       },
-      get getContactAssignment(): ContactManager['getContactAssignment'] {
-        if (!whatsapp?.getContactAssignment) return undefined;
-        return (jid: string) => whatsapp!.getContactAssignment!(jid);
+      get getContactLabelNames(): ContactManager['getContactLabelNames'] {
+        if (!whatsapp?.getContactLabelNames) return undefined;
+        return (jid: string) => whatsapp!.getContactLabelNames!(jid);
       },
       get setTyping(): ContactManager['setTyping'] {
         if (!whatsapp?.setTyping) return undefined;

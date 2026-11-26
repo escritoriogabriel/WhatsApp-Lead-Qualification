@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { GeminiProvider, GeminiQuotaError } from './gemini.js';
 import { OllamaProvider } from './ollama.js';
 import type { AssistantConfig, IntakeProfile } from './config.js';
+import type { StoredMessage } from './database.js';
 
 const profile = {
   id: 'intake', label: 'Triagem', triggers: [], fields: [
@@ -21,7 +22,7 @@ test('Ollama receives a JSON schema and returns only the validated extraction fi
     return new Response(JSON.stringify({ message: { content: '{"capturedFields":{"topic":"Família"}}' } }), { status: 200 });
   });
   const provider = new OllamaProvider('http://127.0.0.1:11434', 'test-model');
-  assert.deepEqual(await provider.extract(profile, [], {}, assistant), { capturedFields: { topic: 'Família' } });
+  assert.deepEqual(await provider.extract(profile, [{ direction: 'inbound', body: 'Família' } as StoredMessage], {}, assistant), { capturedFields: { topic: 'Família' } });
   assert.deepEqual(requestBody.model, 'test-model');
   assert.equal(requestBody.stream, false);
   assert.equal(typeof requestBody.format, 'object');

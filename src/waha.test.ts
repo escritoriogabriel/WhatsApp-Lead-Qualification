@@ -17,6 +17,7 @@ test('WAHA session supports the bot queue, labels, contact updates, and WhatsApp
   let labels = [
     { id: '1', name: 'Novo Lead', color: 7 },
     { id: '10', name: 'VIP', color: 3 },
+    { id: '20', name: 'Clientes', color: 6 },
   ];
   let chatLabels = [{ id: '1', name: 'Novo Lead', color: 7 }, { id: '10', name: 'VIP', color: 3 }];
   let contactUpdate: Record<string, unknown> | null = null;
@@ -135,9 +136,11 @@ test('WAHA session supports the bot queue, labels, contact updates, and WhatsApp
   assert.equal((await whatsapp.getStatus?.())?.connected, true);
   assert.equal((await whatsapp.getStatus?.())?.engine, 'GOWS');
 
-  await whatsapp.setContactAssignment('15551234567@s.whatsapp.net', 'BOT');
-  assert.deepEqual(chatLabels.map((label) => label.name).sort(), ['Bot - atendimento', 'VIP']);
-  assert.equal(await whatsapp.getContactAssignment?.('15551234567@s.whatsapp.net'), 'BOT');
+  await whatsapp.setContactLabels('15551234567@s.whatsapp.net', 'BOT');
+  assert.deepEqual(chatLabels.map((label) => label.name).sort(), ['Bot - atendimento', 'Novo Lead', 'VIP']);
+  assert.deepEqual((await whatsapp.getContactLabelNames?.('15551234567@s.whatsapp.net'))?.sort(), ['Bot - atendimento', 'Novo Lead', 'VIP']);
+  chatLabels = [...chatLabels, labels.find((label) => label.name === 'Clientes')!];
+  await assert.rejects(whatsapp.setContactLabels('15551234567@s.whatsapp.net', 'BOT'), /lista Clientes/);
   await whatsapp.renameContact('15551234567@s.whatsapp.net', 'Ana Maria Silva');
   assert.deepEqual(contactUpdate, { firstName: 'Ana', lastName: 'Maria Silva' });
   await whatsapp.sendText('15551234567@s.whatsapp.net', 'Olá');

@@ -12,6 +12,7 @@
     "start": "node --enable-source-maps dist/index.js",
     "lint": "node --check public/app.js",
     "test": "node --import tsx --test src/*.test.ts",
+    "benchmark:ai": "node --import dotenv/config scripts/benchmark-models.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {

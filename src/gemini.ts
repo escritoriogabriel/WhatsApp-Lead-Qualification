@@ -79,7 +79,7 @@ export class GeminiProvider implements IntakeAIProvider {
     const candidate = result.candidates?.[0];
     const content = candidate?.content?.parts?.filter((part) => !part.thought).map((part) => typeof part.text === 'string' ? part.text : '').join('').trim();
     if (!content) throw new Error('Gemini não retornou uma extração estruturada utilizável.');
-    return parseExtraction(content, profile);
+    return parseExtraction(content, profile, history);
   }
 }
 

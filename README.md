@@ -6,16 +6,16 @@ O modelo de IA **não redige mensagens ao contato**, não escolhe quem pode rece
 
 ## Estado do projeto
 
-Esta versão inclui os adaptadores Meta Cloud API, WAHA e Baileys, uma fila persistente, controles de autorização, retenção configurável e testes com mocks. Ela ainda exige configuração, revisão jurídica e teste em ambiente controlado antes de qualquer uso com dados reais. Não oferece garantia de envio único ou disponibilidade contínua.
+Esta versão usa WAHA ou Baileys, uma fila persistente e as listas nativas do WhatsApp para autorizar respostas. A Meta Cloud API é recusada porque o adaptador atual não sincroniza essas listas. A aplicação ainda exige configuração e validação em ambiente controlado antes de qualquer uso com dados reais. Não oferece garantia de envio único ou disponibilidade contínua.
 
 ## Como funciona a triagem
 
 1. A mensagem recebida é deduplicada pelo identificador do provedor, gravada no SQLite e colocada na fila antes da confirmação do webhook.
-2. O primeiro contato observado pelo programa fica registrado como tal; isso não afirma que a pessoa nunca falou com o escritório antes.
-3. O escritório escolhe no painel se a primeira mensagem recebida inicia a triagem ou se o contato aguarda inclusão explícita na lista elegível.
-4. A resposta só é liberada se a elegibilidade, a atribuição `BOT`, a ausência de pausa e a sincronização exigida pelo provedor estiverem confirmadas. `HUMANO`, pausa manual e bloqueio automático impedem envios.
+2. No primeiro contato observado, o agente consulta as etiquetas nativas. `Clientes` bloqueia a automação; fora dessa lista, o agente aplica `Novo Lead` e `Bot - atendimento` juntos.
+3. A presença de `Bot - atendimento` é a única autorização para responder. `Clientes` bloqueia o envio mesmo quando ambas as etiquetas estão aplicadas.
+4. Remover `Bot - atendimento` interrompe o bot. Ao remover `Clientes`, a próxima mensagem permite retomar a triagem. O sistema não importa histórico antigo.
 5. As respostas são montadas com textos fixos e perguntas do perfil. A divisão em balões é determinística, respeita limites, aguarda o intervalo configurado e verifica a autorização novamente antes do envio.
-6. Falha de autorização mantém mensagens recebidas pendentes. Falha de envio com resultado incerto bloqueia o contato para revisão; o sistema não repete esse envio automaticamente.
+6. Falha ao consultar as listas mantém mensagens recebidas pendentes. Falha de envio com resultado incerto mantém a saída em estado técnico de revisão; o sistema não repete esse envio automaticamente nem altera as listas do contato.
 
 Se a configuração usar Gemini, o primeiro conteúdo da conversa **não é enviado ao modelo**. O bot envia primeiro o aviso externo configurado e só considera mensagens recebidas depois desse aviso. A mensagem inicial fica fora da extração externa. Se o aviso não for confirmado pelo provedor, a triagem externa não continua.
 
@@ -23,23 +23,23 @@ Se a configuração usar Gemini, o primeiro conteúdo da conversa **não é envi
 
 | Provedor | Uso previsto | Autorização | Limitações relevantes |
 |---|---|---|---|
-| **Meta Cloud API** | Opção oficial para produção | Lista interna do painel | Exige conta Business, token, ID do número, assinatura de webhook e endpoint público HTTPS. O adaptador envia texto livre e não oferece templates, verificação de saúde da API nem confirmação de entrega. O status “Configurado” significa que as credenciais foram carregadas, não que a conta foi testada. |
+| **Meta Cloud API** | Indisponível neste fluxo | — | Não sincroniza as listas nativas usadas para autorizar o bot. A aplicação recusa essa seleção. |
 | **WAHA / GOWS** | Teste e operação local | Etiquetas/listas do WhatsApp, conferidas antes de cada envio | Usa sessão do WhatsApp Web. Não oferece a mesma garantia operacional da API oficial. Eventos e APIs de etiquetas são documentados pelo [WAHA](https://waha.devlike.pro/docs/how-to/labels/), [eventos](https://waha.devlike.pro/docs/how-to/events/) e [mecanismos](https://waha.devlike.pro/docs/how-to/engines/). |
 | **Baileys** | Compatibilidade legada | Etiquetas sincronizadas pela sessão | Também usa o protocolo do WhatsApp Web e depende da sincronização da sessão. Não é a integração indicada para produção. |
 
-A aplicação não inclui campanhas, modelos aprovados, acompanhamento de status de entrega ou automação para contornar limites do provedor. Consulte a documentação oficial da [WhatsApp Business Platform](https://developers.facebook.com/documentation/business-messaging/whatsapp/overview), dos [webhooks de WhatsApp](https://developers.facebook.com/docs/graph-api/webhooks/getting-started/webhooks-for-whatsapp/) e das [regras de preços](https://developers.facebook.com/docs/whatsapp/pricing/) antes de estimar custos ou ativar a API.
+A aplicação não inclui campanhas, modelos aprovados, acompanhamento de status de entrega ou automação para contornar limites do provedor. WAHA e Baileys usam uma sessão do WhatsApp Web; avalie as limitações do provedor e do canal antes de operar.
 
-O seletor de provedor fica na página **Conexão WhatsApp**. A seleção e as configurações do assistente são salvas no arquivo JSON com gravação atômica e até 20 revisões. Os segredos permanecem em variáveis de ambiente. Para trocar para Meta ou WAHA, preencha as credenciais correspondentes no servidor; o painel não mostra nem armazena esses segredos.
+O seletor de provedor fica na página **Conexão WhatsApp**. A seleção e as configurações do assistente são salvas no arquivo JSON com gravação atômica e até 20 revisões. Os segredos permanecem em variáveis de ambiente.
 
-O painel não consegue detectar todas as mensagens manuais da equipe em todos os provedores. Use a atribuição `HUMANO` ou `PAUSADO` antes de responder manualmente. No WAHA/Baileys, as etiquetas são conferidas antes de cada envio para bloquear uma transferência que ainda não chegou ao banco local.
+Use a etiqueta `Clientes` para suspender o bot enquanto a pessoa for cliente. WAHA consulta as listas nativas antes de cada envio. Baileys sincroniza o estado `regular` das listas do WhatsApp e atualiza esse espelho antes do envio; se a sincronização falha ou ainda não terminou, as respostas ficam bloqueadas e contatos pendentes são retomados após uma nova sincronização. Essa leitura não importa o histórico de mensagens.
 
 ## Provedores de IA e áudio
 
-- **Ollama** é a opção padrão e executa localmente. O agente pede uma saída JSON limitada aos campos do perfil e valida a resposta com Zod. A documentação do Ollama descreve o modo de [saída estruturada com JSON Schema](https://ollama.com/blog/structured-outputs).
-- **Gemini** é opcional e externo. Quando selecionado, o aviso externo é enviado antes de qualquer extração; materiais e notas internas nunca são enviados. Cota, timeout, erro de rede ou JSON inválido não geram uma resposta livre: o trabalho aguarda, pede esclarecimento com texto fixo ou é encaminhado.
+- **Gemini 3.5 Flash-Lite** é o padrão recomendado após comparação estrita com quatro exemplos sintéticos em português: acertou 4/4, sem JSON inválido ou campos inesperados, com mediana de 3,7 s. A amostra é pequena e não garante desempenho em todos os casos. A integração é externa: o aviso configurado é enviado antes de qualquer extração; materiais e notas internas nunca são enviados. Cota, timeout, erro de rede ou JSON inválido não geram uma resposta livre: o trabalho aguarda, pede esclarecimento com texto fixo ou é encaminhado.
+- **Ollama** permanece como alternativa local experimental. Qwen3 0.6B acertou 2/4 e Gemma 3 1B, 0/4 na mesma avaliação estrita; ambos deixaram campos indevidos ou não identificaram fatos. Esta máquina mediu arquivos de 1,02 GB e 883 MB, respectivamente; o processo Ollama chegou a cerca de 1,43 GiB de memória residente e 2,25 GiB privada. A resposta JSON é validada e valores sem trecho literal correspondente nas mensagens recebidas são descartados. A documentação do Ollama descreve o modo de [saída estruturada com JSON Schema](https://ollama.com/blog/structured-outputs).
 - **Áudio** começa desativado. Se ativado com Gemini, o aviso externo é enviado antes da primeira transcrição. O arquivo é limitado por tamanho, removido após a tentativa e não é armazenado como material de referência. Transcrição local ainda não está implementada.
 
-Instale o Ollama no host, baixe um modelo compatível e ajuste `OLLAMA_API_URL` e `OLLAMA_MODEL` no `.env`. Exemplo de modelo: `ollama pull qwen3:4b`. A capacidade e a qualidade dependem do hardware e do modelo configurado.
+O `.env.example` seleciona Gemini 3.5 Flash-Lite e exige uma chave válida do Google AI Studio. Para experimentar localmente, instale o Ollama e baixe `qwen3:0.6b`; a central informa o modelo ativo. A simulação não chama modelos nem envia dados.
 
 ## Instalação com Docker Compose
 
@@ -56,9 +56,9 @@ Requisitos: Docker Compose, Node.js 22+ para desenvolvimento e espaço protegido
 4. Acesse o painel em `http://localhost:3000`. As portas do Compose ficam vinculadas ao loopback. A senha aleatória do painel é gravada em `data/panel-password`, a menos que `PANEL_PASSWORD` esteja definida.
 5. Na página **Conexão WhatsApp**, confira o status e leia o QR somente quando decidir conectar um número de teste. Não use um número de cliente.
 
-Para Ollama em host Docker, o Compose usa `host.docker.internal:11434` por padrão; configure `OLLAMA_API_URL_DOCKER` se o serviço estiver em outro endereço. O Compose sobe WAHA mesmo que outro provedor esteja selecionado; para produção com Meta, prefira uma implantação em que o webhook `/api/meta/webhook` seja publicado por HTTPS e o WAHA não seja necessário.
+Para Ollama em host Docker, o Compose usa `host.docker.internal:11434` por padrão; configure `OLLAMA_API_URL_DOCKER` se o serviço estiver em outro endereço. O Compose sobe WAHA mesmo que Baileys esteja selecionado.
 
-O processo pode ser executado diretamente com Node.js. O provedor deve estar acessível no endereço configurado e, para webhooks WAHA, também precisa alcançar `/api/waha/webhook`. Para Meta, configure `WHATSAPP_PROVIDER=meta` como fallback inicial ou selecione **Meta Cloud API** no painel; informe `META_ACCESS_TOKEN`, `META_PHONE_NUMBER_ID`, `META_GRAPH_API_VERSION`, `META_APP_SECRET` e `META_WEBHOOK_VERIFY_TOKEN`. Configure no painel da Meta o webhook público `https://seu-dominio/api/meta/webhook` com a mesma chave de verificação. Não exponha o painel sem HTTPS e senha forte.
+O processo pode ser executado diretamente com Node.js. Selecione WAHA ou Baileys. Para webhooks WAHA, o provedor também precisa alcançar `/api/waha/webhook`. Não exponha o painel sem HTTPS e senha forte.
 
 No primeiro início, o painel pode gerar uma senha em `data/panel-password`. Em VPS, prefira túnel SSH ou proxy HTTPS e mantenha as portas administrativas fechadas para a internet. Faça backups protegidos de `data/`, do volume `waha_sessions` e do arquivo de configuração. O banco guarda conversas, contatos, estado da triagem e fila; os backups são dados pessoais.
 
@@ -66,18 +66,18 @@ No primeiro início, o painel pode gerar uma senha em `data/panel-password`. Em 
 
 O painel configura:
 
-- provedor WhatsApp, provedor de IA, política da primeira mensagem e transcrição de áudio;
+- provedor WhatsApp, provedor de IA e transcrição de áudio;
 - perfis, campos, perguntas, tipos de resposta, opções e condições;
 - textos de abertura, aviso virtual, privacidade, aviso externo, esclarecimento, urgência, conclusão e encaminhamento;
 - termos configuráveis de urgência, pedido de atendimento humano, perguntas jurídicas e temas que devem ir à equipe;
 - tamanho e quantidade de balões, agrupamento de mensagens, atraso, presença de digitação e limites por contato e globais;
 - retenção, revisão e restauração de configuração.
 
-Os termos de elegibilidade no WAHA/Baileys são os nomes `Bot - atendimento`, `Atendimento` e `Novo Lead`. `Atendimento` prevalece sobre a lista Bot. No provedor Meta, use a lista interna da página **Contatos e listas**. Os textos de abertura e pergunta são conteúdo editável; o campo “nota de redação” serve à equipe e não muda a resposta do bot.
+As listas são `Novo Lead`, `Bot - atendimento`, `Clientes` e `Atendimento`. `Clientes` bloqueia o bot; `Atendimento` não autoriza respostas. `Novo Lead` e `Bot - atendimento` coexistem.
 
 O envio para a equipe via `HUMAN_NOTIFY_JID` funciona nos provedores WhatsApp Web. O adaptador Meta não envia resumo interno: o encaminhamento fica registrado no painel, pois a integração não implementa mensagens template para esse destino.
 
-## Dados, autorização e retenção
+## Dados, listas e retenção
 
 - Mensagens recebidas e saídas, estado de conversas e fila ficam em SQLite com WAL; o projeto pressupõe uma única instância.
 - O prazo `retentionDays` remove mensagens processadas, diagnósticos e itens terminais de fila/saída. Mensagens de entrada ainda pendentes são preservadas. A limpeza não substitui política de backup, controle de acesso ou exclusão legal.
@@ -101,10 +101,12 @@ docker compose config --quiet
 
 Os testes usam banco temporário, servidor HTTP local e mocks de `fetch`; não pareiam WhatsApp nem enviam mensagens reais. A CI executa as mesmas verificações e valida o Compose com valores de ambiente fictícios.
 
+Para comparar extração com exemplos sintéticos, instale os modelos locais `qwen3:0.6b` e `gemma3:1b` no Ollama e execute `npm run benchmark:ai`. O ensaio envia apenas textos fixos sintéticos; Gemini só é consultado se `GEMINI_API_KEY` estiver definida no ambiente do processo.
+
 ## Limitações conhecidas
 
-- O adaptador Meta não implementa envio de templates, confirmação de entrega, diagnóstico de saúde remoto, transcrição de áudio ou alerta interno via WhatsApp. O código apenas valida a configuração e o recebimento assinado do webhook.
+- A Meta Cloud API não é compatível com o fluxo de autorização por listas nativas e é bloqueada na configuração.
 - O aviso externo é informativo; o escritório deve revisar sua redação e a base legal aplicável ao uso de dados antes de ativar Gemini. A integração não valida políticas de retenção do provedor externo.
-- Transcrição local de áudio, janela de atendimento/expediente, condições de encaminhamento em árvore e listas de exclusão configuráveis ainda não estão implementadas.
+- Transcrição local de áudio e janela de atendimento/expediente ainda não estão implementadas.
 - Eventos repetidos são deduplicados e envios incertos são pausados, mas não há garantia de entrega exatamente uma vez entre SQLite e API externa.
 - Etiquetas do WhatsApp Web podem perder sincronização ou ficar indisponíveis. Em caso de dúvida, o agente deve permanecer pausado até revisão.

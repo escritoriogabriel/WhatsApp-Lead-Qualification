@@ -7,7 +7,7 @@ import yauzl from 'yauzl';
 import type { Logger } from 'pino';
 import { z } from 'zod';
 import { ConfigValidationError, validateAssistantConfig, type AssistantConfig } from './config.js';
-import { AgentDatabase, type ContactAssignment } from './database.js';
+import { AgentDatabase } from './database.js';
 import type { WhatsAppStatus } from './whatsapp.js';
 import { validMetaSignature } from './meta.js';
 
@@ -18,9 +18,9 @@ interface PanelOptions {
   port: number;
   password: string;
   getConfig: () => AssistantConfig;
+  getAiModels?: () => { ollama: string; gemini: string };
   setConfig: (config: AssistantConfig) => Promise<void> | void;
   database: AgentDatabase;
-  setContactAssignment: (jid: string, assignment: ContactAssignment) => Promise<void>;
   getWhatsAppStatus: () => Promise<WhatsAppStatus>;
   getWhatsAppQr: () => Promise<Buffer | null>;
   restartWhatsApp: () => Promise<void>;
@@ -51,6 +51,10 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
     addSecurityHeaders(response);
     try {
       const url = new URL(request.url ?? '/', `http://${request.headers.host ?? 'localhost'}`);
+      if (url.pathname === '/api/contacts' || url.pathname.startsWith('/api/contacts/')) {
+        sendJson(response, 410, { error: 'A autorização e a classificação são controladas pelas listas do WhatsApp.' });
+        return;
+      }
       if (request.method === 'POST' && url.pathname === '/api/waha/webhook') {
         const suppliedSecret = request.headers['x-waha-webhook-secret'];
         if (!options.wahaWebhookSecret || !options.handleWahaWebhook || !safeEqual(Array.isArray(suppliedSecret) ? suppliedSecret[0] ?? '' : suppliedSecret ?? '', options.wahaWebhookSecret)) {
@@ -187,6 +191,10 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
           sendJson(response, 200, options.getConfig());
           return;
         }
+        if (request.method === 'GET' && url.pathname === '/api/ai/models') {
+          sendJson(response, 200, options.getAiModels?.() ?? { ollama: 'configurado no ambiente', gemini: 'configurado no ambiente' });
+          return;
+        }
         if (request.method === 'POST' && url.pathname === '/api/materials/import') {
           if (!sameOrigin(request)) {
             sendJson(response, 403, { error: 'Origem da requisição inválida.' });
@@ -236,73 +244,8 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
           sendJson(response, 200, { imported: results.filter((item) => item.ok).length, results });
           return;
         }
-        if (request.method === 'GET' && url.pathname === '/api/contacts') {
-          sendJson(response, 200, options.database.listContacts());
-          return;
-        }
         if (request.method === 'GET' && url.pathname === '/api/diagnostics') {
           sendJson(response, 200, options.database.listDiagnostics());
-          return;
-        }
-        if (request.method === 'PUT' && url.pathname === '/api/contacts/assignment') {
-          if (!sameOrigin(request)) {
-            sendJson(response, 403, { error: 'Origem da requisição inválida.' });
-            return;
-          }
-          const body = await readJson(request);
-          const jid = normalizePhone(String(body.phone ?? body.jid ?? ''));
-          const assignment = normalizeAssignment(body.assignment);
-          if (!jid || !assignment) {
-            sendJson(response, 400, { error: 'Informe um telefone válido e a lista Novo Lead, Bot - atendimento ou Atendimento.' });
-            return;
-          }
-          const contactAssignment = assignment;
-          options.database.ensureContact(jid, 'PAUSADO', 'panel');
-          try {
-            await options.setContactAssignment(jid, contactAssignment);
-          } catch (error) {
-            options.database.blockAutomation(jid, 'system-assignment-sync');
-            options.database.recordDiagnostic(jid, 'falha-lista', 'Não foi possível confirmar a atribuição no provedor WhatsApp.');
-            throw new Error('Não foi possível confirmar a atribuição no provedor WhatsApp. O contato permanece pausado.');
-          }
-          options.database.setContactAssignment(jid, contactAssignment, contactAssignment === 'PAUSADO' ? 'panel-pause' : 'panel');
-          if (contactAssignment === 'BOT') options.database.queueConversationStart(jid);
-          options.database.recordDiagnostic(jid, 'atribuicao', `Alterada no painel: ${contactAssignment}`);
-          sendJson(response, 200, { ok: true, jid, assignment: contactAssignment });
-          return;
-        }
-        if (request.method === 'POST' && url.pathname === '/api/contacts/import') {
-          if (!sameOrigin(request)) {
-            sendJson(response, 403, { error: 'Origem da requisição inválida.' });
-            return;
-          }
-          const body = await readJson(request);
-          const imported = parseContactCsv(String(body.csv ?? ''));
-          const results: Array<{ phone: string; assignment: string; ok: boolean; error?: string }> = [];
-          for (const row of imported) {
-            const jid = normalizePhone(row.phone);
-            const assignment = normalizeAssignment(row.assignment);
-            if (!jid || !assignment) {
-              results.push({ phone: row.phone, assignment: row.assignment, ok: false, error: 'Telefone ou lista inválidos. Use NOVO_LEAD, BOT ou HUMANO.' });
-              continue;
-            }
-            try {
-              const contactAssignment = assignment;
-              options.database.ensureContact(jid, 'PAUSADO', 'csv-import');
-              if (row.name) options.database.setContactName(jid, row.name.slice(0, 120));
-              await options.setContactAssignment(jid, contactAssignment);
-              options.database.setContactAssignment(jid, contactAssignment, assignment === 'PAUSADO' ? 'panel-pause' : 'csv-import');
-              if (contactAssignment === 'BOT') options.database.queueConversationStart(jid);
-              options.database.recordDiagnostic(jid, 'importacao', `CSV: ${contactAssignment}`);
-              results.push({ phone: row.phone, assignment: row.assignment, ok: true });
-            } catch (error) {
-              const message = error instanceof Error ? error.message : 'Falha ao sincronizar etiqueta.';
-              options.database.blockAutomation(jid, 'system-assignment-sync');
-              options.database.recordDiagnostic(jid, 'falha-importacao', message);
-              results.push({ phone: row.phone, assignment: row.assignment, ok: false, error: message });
-            }
-          }
-          sendJson(response, 200, { imported: results.filter((row) => row.ok).length, results });
           return;
         }
         if (request.method === 'GET' && url.pathname === '/api/revisions') {
@@ -532,57 +475,6 @@ function validationFix(message: string): string {
   if (message.includes('Too small') || message.includes('too_small')) return 'Preencha este campo antes de salvar.';
   if (message.includes('Invalid input')) return 'Escolha um valor válido para este campo.';
   return 'Revise o valor informado.';
-}
-
-function normalizePhone(value: string): string {
-  const trimmed = value.trim();
-  if (trimmed.endsWith('@s.whatsapp.net') || trimmed.endsWith('@lid')) return trimmed;
-  const digits = trimmed.replace(/\D/g, '');
-  if (digits.length < 10 || digits.length > 15) return '';
-  return digits + '@s.whatsapp.net';
-}
-
-function normalizeAssignment(value: unknown): ContactAssignment | null {
-  const normalized = String(value ?? '').trim().toLocaleLowerCase('pt-BR').replaceAll('_', ' ').replaceAll('-', ' ').replace(/\s+/g, ' ');
-  if (normalized === 'bot' || normalized === 'bot atendimento') return 'BOT';
-  if (normalized === 'humano' || normalized === 'atendimento') return 'HUMANO';
-  if (normalized === 'pausado' || normalized === 'novo lead') return 'PAUSADO';
-  return null;
-}
-
-function parseContactCsv(csv: string): Array<{ phone: string; assignment: string; name?: string }> {
-  const lines = csv.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  if (lines.length > 1001) throw new Error('Importe no máximo 1.000 contatos por vez.');
-  const rows = lines.map(parseCsvLine);
-  const hasHeader = rows.length > 0 && rows[0]!.some((cell) => /^(telefone|phone|numero|nome|name|atribuicao|assignment)$/i.test(cell.trim()));
-  const headers = hasHeader ? rows.shift()!.map((item) => item.trim().toLowerCase()) : [];
-  return rows.map((cells) => {
-    const phoneIndex = headers.length ? headers.findIndex((name) => ['telefone', 'phone', 'numero'].includes(name)) : 0;
-    const assignmentIndex = headers.length ? headers.findIndex((name) => ['atribuicao', 'assignment'].includes(name)) : 1;
-    const nameIndex = headers.length ? headers.findIndex((name) => ['nome', 'name'].includes(name)) : 2;
-    const name = nameIndex >= 0 ? cells[nameIndex]?.trim() : undefined;
-    return {
-      phone: cells[phoneIndex >= 0 ? phoneIndex : 0] ?? '',
-      assignment: (cells[assignmentIndex >= 0 ? assignmentIndex : 1] ?? '').trim().toUpperCase(),
-      ...(name ? { name } : {}),
-    };
-  });
-}
-
-function parseCsvLine(line: string): string[] {
-  const delimiter = line.includes(';') ? ';' : ',';
-  const values: string[] = [];
-  let current = '';
-  let quoted = false;
-  for (let index = 0; index < line.length; index += 1) {
-    const character = line[index]!;
-    if (character === '"' && line[index + 1] === '"' && quoted) { current += '"'; index += 1; }
-    else if (character === '"') quoted = !quoted;
-    else if (character === delimiter && !quoted) { values.push(current.trim()); current = ''; }
-    else current += character;
-  }
-  values.push(current.trim());
-  return values;
 }
 
 async function resolvePanelPassword(configuredPassword: string): Promise<string> {

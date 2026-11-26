@@ -11,15 +11,17 @@ import makeWASocket, {
 import qrcode from 'qrcode-terminal';
 import type { Logger } from 'pino';
 import type { RuntimeConfig } from './config.js';
-import type { ContactAssignment, IncomingMessage } from './database.js';
+import type { IncomingMessage } from './database.js';
 import { SendOutcomeUnknownError } from './provider-errors.js';
 
 export interface WhatsAppLabel { id: string; name: string; color: number; deleted: boolean }
 export interface WhatsAppLabelAssociation { type: string; chatId: string; labelId: string }
+export type WhatsAppLabelTarget = 'BOT' | 'HUMANO';
 export interface WhatsAppStatus {
   provider: 'baileys' | 'waha' | 'meta';
   state: string;
   connected: boolean;
+  labelsReady?: boolean;
   session?: string;
   engine?: string;
   account?: string;
@@ -29,17 +31,19 @@ export interface WhatsAppCallbacks {
   onLabelEdit: (label: WhatsAppLabel) => void;
   onLabelAssociation: (association: WhatsAppLabelAssociation, add: boolean) => void;
   getLabelId: (name: string) => string | undefined;
+  getContactLabelNames?: (jid: string) => string[];
+  onLabelsReady?: () => Promise<void> | void;
 }
 
 type MessageContent = NonNullable<WAMessage['message']>;
-const listNames = ['Novo Lead', 'Bot - atendimento', 'Atendimento'] as const;
+const listNames = ['Novo Lead', 'Bot - atendimento', 'Atendimento', 'Clientes'] as const;
 
 export interface WhatsAppConnection {
   sendText(jid: string, text: string): Promise<void>;
   setTyping?(jid: string, typing: boolean): Promise<void>;
-  setContactAssignment(jid: string, assignment: ContactAssignment): Promise<void>;
+  setContactLabels(jid: string, target: WhatsAppLabelTarget): Promise<void>;
   renameContact(jid: string, name: string): Promise<void>;
-  getContactAssignment?(jid: string): Promise<ContactAssignment>;
+  getContactLabelNames?(jid: string): Promise<string[]>;
   close(): Promise<void>;
   getStatus?(): Promise<WhatsAppStatus>;
   getQrPng?(): Promise<Buffer | null>;
@@ -54,6 +58,8 @@ export async function connectWhatsApp(
   onLabelEdit: (label: WhatsAppLabel) => void,
   onLabelAssociation: (association: WhatsAppLabelAssociation, add: boolean) => void,
   getLabelId: (name: string) => string | undefined,
+  getContactLabelNames?: (jid: string) => string[],
+  onLabelsReady?: () => Promise<void> | void,
 ): Promise<WhatsAppConnection> {
   await mkdir(config.authDir, { recursive: true, mode: 0o700 });
   await mkdir(config.mediaDir, { recursive: true, mode: 0o700 });
@@ -64,6 +70,11 @@ export async function connectWhatsApp(
   let pairingRequired = false;
   let connected = false;
   let hasAppStateSyncKey = false;
+  let labelSyncReady = false;
+  let labelSyncAt = 0;
+  let labelSyncInFlight: Promise<boolean> | undefined;
+  let labelSyncToken: object | undefined;
+  let labelSyncRetryTimer: NodeJS.Timeout | undefined;
   const labelIds = new Map<string, string>();
   const labelCreations = new Map<string, Promise<string>>();
   const localAssociationMutations = new Map<string, { count: number; timer: NodeJS.Timeout }>();
@@ -86,8 +97,58 @@ export async function connectWhatsApp(
   };
   const applyLocalAssociation = async (jid: string, labelId: string, operation: 'add' | 'remove', mutate: () => Promise<void>) => {
     const key = reserveLocalAssociation(jid, labelId, operation);
-    try { await mutate(); }
+    try {
+      await mutate();
+      onLabelAssociation({ type: 'label_jid', chatId: jid, labelId }, operation === 'add');
+    }
     catch (error) { releaseLocalAssociation(key); throw error; }
+  };
+  const syncNativeLabels = (activeSocket: WASocket, initialSync: boolean): Promise<boolean> => {
+    if (labelSyncInFlight) return labelSyncInFlight;
+    const wasReady = labelSyncReady;
+    labelSyncReady = false;
+    const token = {};
+    labelSyncToken = token;
+    const sync = (async (): Promise<boolean> => {
+      try {
+        // Account app-state contains native labels; this does not import message history.
+        await activeSocket.resyncAppState(['regular'], initialSync);
+        activeSocket.ev.flush();
+        if (socket !== activeSocket || !connected || closing) return false;
+        labelSyncReady = true;
+        labelSyncAt = Date.now();
+        logger.info('Listas nativas do WhatsApp sincronizadas');
+        if (!wasReady) await onLabelsReady?.();
+        return true;
+      } catch (error) {
+        labelSyncReady = false;
+        logger.error({ error: safeError(error) }, 'Falha ao sincronizar as listas nativas; respostas bloqueadas');
+        if (!closing && connected && socket === activeSocket && !labelSyncRetryTimer) {
+          labelSyncRetryTimer = setTimeout(() => {
+            labelSyncRetryTimer = undefined;
+            void syncNativeLabels(activeSocket, true);
+          }, 5_000);
+        }
+        return false;
+      } finally {
+        if (labelSyncToken === token) {
+          labelSyncInFlight = undefined;
+          labelSyncToken = undefined;
+        }
+      }
+    })();
+    labelSyncInFlight = sync;
+    return sync;
+  };
+  const getFreshContactLabels = async (jid: string): Promise<string[]> => {
+    const activeSocket = socket;
+    if (!activeSocket || !connected) throw new Error('Sessão WhatsApp desconectada; listas indisponíveis.');
+    if (!labelSyncReady) {
+      if (!labelSyncInFlight || !(await labelSyncInFlight)) throw new Error('Sincronização das listas do WhatsApp ainda não foi confirmada.');
+    } else if (Date.now() - labelSyncAt >= 1_500 && !(await syncNativeLabels(activeSocket, false))) {
+      throw new Error('Não foi possível confirmar as listas atuais do WhatsApp.');
+    }
+    return getContactLabelNames?.(jid) ?? [];
   };
   const ensureLabel = async (jid: string, name: (typeof listNames)[number]): Promise<string> => {
     let id = labelIds.get(name) ?? getLabelId(name);
@@ -127,6 +188,7 @@ export async function connectWhatsApp(
     nextSocket.ev.on('creds.update', () => {
       hasAppStateSyncKey = Boolean(state.creds.myAppStateKeyId);
       void saveCreds();
+      if (connected && hasAppStateSyncKey && !labelSyncReady && !labelSyncInFlight) void syncNativeLabels(nextSocket, true);
     });
     nextSocket.ev.on('labels.edit', (label) => {
       if (label.name) {
@@ -154,11 +216,18 @@ export async function connectWhatsApp(
       }
       if (connection === 'open') {
         connected = true;
+        labelSyncReady = false;
         logger.info('WhatsApp conectado');
-        if (!hasAppStateSyncKey) logger.error('A sessão Baileys está sem myAppStateKeyId; alterações de listas não funcionarão. Faça backup de data/auth e pareie novamente o dispositivo vinculado.');
+        if (!hasAppStateSyncKey) logger.error('A sessão Baileys está sem myAppStateKeyId; respostas bloqueadas até parear novamente o dispositivo vinculado.');
+        else void syncNativeLabels(nextSocket, true);
       }
       if (connection === 'close') {
         connected = false;
+        labelSyncReady = false;
+        labelSyncInFlight = undefined;
+        labelSyncToken = undefined;
+        if (labelSyncRetryTimer) clearTimeout(labelSyncRetryTimer);
+        labelSyncRetryTimer = undefined;
         socket = null;
         const statusCode = (
           lastDisconnect?.error as
@@ -222,19 +291,31 @@ export async function connectWhatsApp(
       if (!socket) throw new Error('WhatsApp socket is not connected');
       await socket.sendPresenceUpdate(typing ? 'composing' : 'paused', jid);
     },
-    async setContactAssignment(jid, assignment) {
+    async setContactLabels(jid, target) {
       if (!socket) throw new Error('WhatsApp socket is not connected');
       if (!hasAppStateSyncKey) throw new Error('Sessão Baileys sem chave de sincronização de estado (myAppStateKeyId). Faça backup de data/auth e pareie novamente o dispositivo vinculado no WhatsApp.');
-      const target = assignment === 'BOT' ? 'Bot - atendimento' : assignment === 'HUMANO' ? 'Atendimento' : 'Novo Lead';
+      const currentLabels = await getFreshContactLabels(jid);
+      if (target === 'BOT' && currentLabels.some((name) => name.trim().toLocaleLowerCase('pt-BR') === 'clientes')) {
+        throw new Error('Contato está na lista Clientes; remova essa etiqueta antes de ativar o bot.');
+      }
+      const targetName = target === 'BOT' ? 'Bot - atendimento' : 'Atendimento';
       const ids = await Promise.all(listNames.map((name) => ensureLabel(jid, name)));
-      const targetId = ids[listNames.indexOf(target)];
-      for (const id of ids) if (id !== targetId) await applyLocalAssociation(jid, id, 'remove', () => socket!.removeChatLabel(jid, id));
+      const targetId = ids[listNames.indexOf(targetName)];
+      const newLeadId = ids[listNames.indexOf('Novo Lead')];
+      for (const id of ids) {
+        const clientId = ids[listNames.indexOf('Clientes')];
+        if (id === targetId || id === clientId || (target === 'BOT' && id === newLeadId)) continue;
+        await applyLocalAssociation(jid, id, 'remove', () => socket!.removeChatLabel(jid, id));
+      }
       for (const legacyName of ['BOT', 'HUMANO']) {
         const legacyId = getLabelId(legacyName);
         if (legacyId) await applyLocalAssociation(jid, legacyId, 'remove', () => socket!.removeChatLabel(jid, legacyId));
       }
       await applyLocalAssociation(jid, targetId!, 'add', () => socket!.addChatLabel(jid, targetId!));
+      if (target === 'BOT' && newLeadId !== targetId) await applyLocalAssociation(jid, newLeadId!, 'add', () => socket!.addChatLabel(jid, newLeadId!));
+      labelSyncAt = Date.now();
     },
+    async getContactLabelNames(jid) { return getFreshContactLabels(jid); },
     async renameContact(jid, name) {
       if (!socket) throw new Error('WhatsApp socket is not connected');
       const cleaned = name.trim().replace(/\s+/g, ' ').slice(0, 120);
@@ -246,14 +327,16 @@ export async function connectWhatsApp(
       });
     },
     async getStatus() {
-      return { provider: 'baileys', state: connected ? 'WORKING' : pairingRequired ? 'FAILED' : 'DISCONNECTED', connected };
+      return { provider: 'baileys', state: connected ? labelSyncReady ? 'WORKING' : 'SYNCING_LABELS' : pairingRequired ? 'FAILED' : 'DISCONNECTED', connected, labelsReady: labelSyncReady };
     },
     async close() {
       closing = true;
       connected = false;
       if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (labelSyncRetryTimer) clearTimeout(labelSyncRetryTimer);
       socket?.end(undefined);
       socket = null;
+      labelSyncReady = false;
     },
   };
 }
@@ -263,6 +346,7 @@ function normalizeListName(name: string): (typeof listNames)[number] | undefined
   if (normalized === 'novo lead') return 'Novo Lead';
   if (normalized === 'bot - atendimento') return 'Bot - atendimento';
   if (normalized === 'atendimento' || normalized === 'humano') return 'Atendimento';
+  if (normalized === 'clientes') return 'Clientes';
   return undefined;
 }
 

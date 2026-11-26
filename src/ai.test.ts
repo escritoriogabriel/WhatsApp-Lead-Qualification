@@ -14,16 +14,57 @@ const profile = {
 
 const assistant = { maxHistoryMessages: 4, officeMemory: 'texto não deve ser enviado', materials: [{ title: 'interno', content: 'segredo' }] } as AssistantConfig;
 
-test('accepts only configured extraction fields and trims values', () => {
-  assert.deepEqual(parseExtraction('{"capturedFields":{"subject":"  Família  "}}', profile), {
+const inbound = (body: string) => [{ direction: 'inbound', body } as StoredMessage];
+
+test('accepts only configured extraction fields when values are grounded in inbound text', () => {
+  assert.deepEqual(parseExtraction('{"capturedFields":{"subject":"  Família  "}}', profile, inbound('Preciso de ajuda com Família.')), {
     capturedFields: { subject: 'Família' },
   });
 });
 
+test('drops values invented by the model and values that only appear in assistant messages', () => {
+  const history = [
+    { direction: 'inbound', body: 'Preciso de ajuda com trabalho.' },
+    { direction: 'outbound', body: 'Qual cidade? Recife?' },
+  ] as StoredMessage[];
+  assert.deepEqual(parseExtraction('{"capturedFields":{"subject":"Família","city":"Recife"}}', profile, history), {
+    capturedFields: {},
+  });
+});
+
+test('validates yes/no and choice fields against their configured answers', () => {
+  const typedProfile = {
+    ...profile,
+    fields: [
+      { ...profile.fields[0]!, id: 'deadline', type: 'yes_no' },
+      { ...profile.fields[1]!, id: 'area', type: 'single_choice', options: ['Trabalhista', 'Família'] },
+    ],
+  } as IntakeProfile;
+  assert.deepEqual(parseExtraction('{"capturedFields":{"deadline":"Sim!","area":"Trabalhista"}}', typedProfile, inbound('Sim! Quero atendimento Trabalhista.')), {
+    capturedFields: { deadline: 'sim', area: 'Trabalhista' },
+  });
+  assert.deepEqual(parseExtraction('{"capturedFields":{"deadline":"talvez","area":"Criminal"}}', typedProfile, inbound('Talvez, é um caso Criminal.')), {
+    capturedFields: {},
+  });
+});
+
+test('does not accept a service request as a contact name', () => {
+  const nameProfile = {
+    ...profile,
+    fields: [{ ...profile.fields[0]!, id: 'name', label: 'Nome', contactName: true }],
+  } as IntakeProfile;
+  assert.deepEqual(parseExtraction('{"capturedFields":{"name":"Quero conversar com um advogado"}}', nameProfile, inbound('Quero conversar com um advogado.')), {
+    capturedFields: {},
+  });
+  assert.deepEqual(parseExtraction('{"capturedFields":{"name":"Meu nome é Ana"}}', nameProfile, inbound('Meu nome é Ana.')), {
+    capturedFields: { name: 'Ana' },
+  });
+});
+
 test('rejects invalid JSON, extra fields, and overlong values', () => {
-  assert.throws(() => parseExtraction('texto livre', profile), /JSON inválido/);
-  assert.throws(() => parseExtraction('{"capturedFields":{"other":"x"}}', profile), /schema configurado/);
-  assert.throws(() => parseExtraction(JSON.stringify({ capturedFields: { subject: 'x'.repeat(501) } }), profile), /schema configurado/);
+  assert.throws(() => parseExtraction('texto livre', profile, []), /JSON inválido/);
+  assert.throws(() => parseExtraction('{"capturedFields":{"other":"x"}}', profile, []), /schema configurado/);
+  assert.throws(() => parseExtraction(JSON.stringify({ capturedFields: { subject: 'x'.repeat(501) } }), profile, []), /schema configurado/);
 });
 
 test('extraction schema and input contain only configured intake fields and recent conversation', () => {

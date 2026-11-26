@@ -31,7 +31,7 @@ const ProfileSchema = z.object({
 
 const AssistantConfigSchema = z.object({
   whatsappProvider: z.enum(['meta', 'waha', 'baileys']).default('waha'),
-  aiProvider: z.enum(['ollama', 'gemini']).default('ollama'),
+  aiProvider: z.enum(['ollama', 'gemini']).default('gemini'),
   audioTranscriptionProvider: z.enum(['disabled', 'gemini']).default('disabled'),
   officeName: z.string().min(1),
   assistantName: z.string().min(1),
@@ -40,7 +40,6 @@ const AssistantConfigSchema = z.object({
   forbiddenTopics: z.array(z.string().min(1).max(200)).max(50).default([]),
   materials: z.array(z.object({ title: z.string().min(1).max(160), content: z.string().min(1).max(20_000) })).max(20).default([]),
   greeting: z.string().min(1),
-  firstMessagePolicy: z.enum(['auto', 'explicit']).default('explicit'),
   assistantNotice: z.string().min(1).max(500).default('Sou um assistente virtual e faço somente a triagem inicial. Não sou advogado.'),
   privacyNotice: z.string().max(1000).default('Compartilhe apenas as informações necessárias para esta triagem. Não envie documentos ou dados sensíveis nesta conversa.'),
   externalProviderNotice: z.string().min(1).max(1000).default('Para continuar, o conteúdo que você enviar após este aviso poderá ser enviado ao Google Gemini para processamento da triagem. Se preferir, peça atendimento humano ou não continue.'),
@@ -67,7 +66,6 @@ const AssistantConfigSchema = z.object({
   maxMessagesSentPerDay: z.number().int().min(1).max(1_000_000).default(2_000),
   maxMessagesSentPerMonth: z.number().int().min(1).max(10_000_000).default(20_000),
   retentionDays: z.number().int().min(1).max(3650).default(90),
-  newContactsOnly: z.boolean().default(true),
   maxFieldAttempts: z.number().int().min(1).max(5),
   maxAudioBytes: z.number().int().min(1024).max(25_000_000),
   maxHistoryMessages: z.number().int().min(1).max(50),
@@ -143,9 +141,9 @@ export function loadRuntimeConfig(): RuntimeConfig {
 
   return {
     ollamaApiUrl: (process.env.OLLAMA_API_URL ?? 'http://localhost:11434').replace(/\/+$/, ''),
-    ollamaModel: process.env.OLLAMA_MODEL ?? 'qwen3:4b',
+    ollamaModel: process.env.OLLAMA_MODEL ?? 'qwen3:0.6b',
     geminiApiKey: process.env.GEMINI_API_KEY ?? '',
-    geminiModel: process.env.GEMINI_MODEL ?? 'gemini-3.5-flash',
+    geminiModel: process.env.GEMINI_MODEL ?? 'gemini-3.5-flash-lite',
     whatsappProvider: configuredProvider,
     wahaApiUrl: (process.env.WAHA_API_URL ?? 'http://localhost:3001').replace(/\/+$/, ''),
     wahaApiKey,
@@ -170,6 +168,9 @@ export function loadRuntimeConfig(): RuntimeConfig {
 export function validateAssistantConfig(value: unknown): AssistantConfig {
   const migrated = migrateLegacyTimes(value);
   const parsed = AssistantConfigSchema.parse(migrated);
+  if (parsed.whatsappProvider === 'meta') {
+    throw new ConfigValidationError('whatsappProvider', 'Este fluxo depende das listas nativas do WhatsApp, indisponíveis na Meta Cloud API.', 'Selecione WAHA ou Baileys.');
+  }
 
   for (const [path, seconds] of [
     ['batchWindowSeconds', parsed.batchWindowSeconds],

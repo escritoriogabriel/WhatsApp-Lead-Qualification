@@ -17,6 +17,7 @@ const rawConfig = JSON.parse(await readFile(join(process.cwd(), 'config/qualific
 function assistant(overrides: Record<string, unknown> = {}) {
   return validateAssistantConfig({
     ...rawConfig,
+    aiProvider: 'ollama',
     simulateTyping: false,
     batchWindowSeconds: 0,
     sendPartDelaySeconds: 0,
@@ -39,23 +40,33 @@ async function createHarness(context: { after(callback: () => void | Promise<voi
   await mkdir(mediaDir, { recursive: true });
   const db = new AgentDatabase(join(directory, 'agent.sqlite'), 0);
   context.after(async () => { db.close(); await rm(directory, { recursive: true, force: true }); });
-  db.setContactAssignment(jid, 'BOT', 'panel');
+  db.saveLabel('bot-label', 'Bot - atendimento');
+  db.updateContactLabel(jid, 'bot-label', 'Bot - atendimento', true);
   const currentAssistant = options.config ?? assistant();
   const sent: string[] = [];
-  const stateChanges: string[] = [];
+  const labelChanges: string[] = [];
   const provider: IntakeAIProvider = options.provider ?? {
     extract: async () => ({ capturedFields: {} }),
     transcribe: async () => 'transcrição de teste',
   };
   const contacts = {
-    setContactAssignment: async (_jid: string, assignment: 'BOT' | 'HUMANO' | 'PAUSADO') => { stateChanges.push(assignment); },
+    setContactLabels: async (_jid: string, target: 'BOT' | 'HUMANO') => {
+      labelChanges.push(target);
+      if (target === 'BOT') db.updateContactLabel(jid, 'bot-label', 'Bot - atendimento', true);
+      else db.updateContactLabel(jid, 'bot-label', 'Bot - atendimento', false);
+      if (target === 'HUMANO') {
+        db.saveLabel('human-label', 'Atendimento');
+        db.updateContactLabel(jid, 'human-label', 'Atendimento', true);
+      }
+    },
     renameContact: async () => undefined,
     getStatus: async () => ({ connected: true }),
+    getContactLabelNames: async () => db.getContactLabelNames(jid),
   };
   const runtime = { humanNotifyJid: undefined } as unknown as RuntimeConfig;
   const worker = new QualificationWorker(db, provider, () => currentAssistant, runtime,
     async (_jid, text) => { sent.push(text); }, contacts, pino({ level: 'silent' }));
-  return { db, worker, sent, stateChanges, provider, mediaDir, directory };
+  return { db, worker, sent, labelChanges, provider, mediaDir, directory };
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
@@ -66,10 +77,10 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
   }
 }
 
-test('keeps inbound messages pending while assignment is paused, then resumes only after explicit authorization', async (context) => {
+test('keeps inbound messages pending after Bot is removed, then resumes when the label returns', async (context) => {
   const harness = await createHarness(context);
-  harness.db.setContactAssignment(jid, 'PAUSADO', 'panel-pause');
   harness.db.saveIncoming(message('paused-message'));
+  harness.db.updateContactLabel(jid, 'bot-label', 'Bot - atendimento', false);
   const abort = new AbortController();
   const run = harness.worker.run(abort.signal);
   await waitFor(() => harness.db.listDiagnostics().some((item) => item.event === 'aguardando-autorizacao'));
@@ -77,7 +88,7 @@ test('keeps inbound messages pending while assignment is paused, then resumes on
   abort.abort();
   await run;
 
-  harness.db.setContactAssignment(jid, 'BOT', 'panel');
+  harness.db.updateContactLabel(jid, 'bot-label', 'Bot - atendimento', true);
   assert.equal(harness.db.queueConversationStart(jid), true);
   const resumedAbort = new AbortController();
   const resumed = harness.worker.run(resumedAbort.signal);
@@ -92,19 +103,30 @@ test('provider synchronization failure blocks output and leaves inbound messages
   harness.db.saveIncoming(message('provider-offline'));
   const config = assistant();
   const provider: IntakeAIProvider = { extract: async () => ({ capturedFields: {} }), transcribe: async () => '' };
+  let providerAvailable = false;
   const worker = new QualificationWorker(harness.db, provider, () => config, { humanNotifyJid: undefined } as unknown as RuntimeConfig,
     async (_jid, text) => { harness.sent.push(text); }, {
-      setContactAssignment: async () => undefined,
+      setContactLabels: async () => undefined,
       renameContact: async () => undefined,
-      getStatus: async () => { throw new Error('private provider detail'); },
+      getStatus: async () => { if (!providerAvailable) throw new Error('private provider detail'); return { connected: true }; },
+      getContactLabelNames: async () => ['Bot - atendimento'],
     }, pino({ level: 'silent' }));
   const abort = new AbortController();
   const run = worker.run(abort.signal);
-  await waitFor(() => harness.db.listDiagnostics().some((item) => item.event === 'falha-sincronizacao'));
+  await waitFor(() => harness.db.listDiagnostics().some((item) => item.event === 'aguardando-listas'));
   abort.abort();
   await run;
   assert.deepEqual(harness.sent, []);
   assert.equal(harness.db.getUnprocessedMessages(jid).length, 1);
+
+  providerAvailable = true;
+  assert.equal(harness.db.queueConversationStart(jid), false);
+  const resumedAbort = new AbortController();
+  const resumed = worker.run(resumedAbort.signal);
+  await waitFor(() => harness.sent.length >= 2);
+  resumedAbort.abort();
+  await resumed;
+  assert.ok(harness.sent.length > 0);
 });
 
 test('builds the first turn from fixed disclosure and configured question text, never a generated reply', async (context) => {
@@ -146,7 +168,7 @@ test('does not transcribe audio when disabled, removes the temporary file, and u
   await run;
   assert.equal(transcribeCalls, 0);
   assert.equal(harness.sent[0], config.audioRetryMessage);
-  assert.equal(harness.db.getContactAssignment(jid), 'HUMANO');
+  assert.equal(harness.db.isAuthorizedForAutomation(jid), false);
   await assert.rejects(readFile(mediaPath));
 });
 
@@ -228,10 +250,11 @@ test('stops before send if authorization changes during the typing indicator', a
   const provider: IntakeAIProvider = { extract: async () => ({ capturedFields: {} }), transcribe: async () => '' };
   const secondWorker = new QualificationWorker(harness.db, provider, () => config, { humanNotifyJid: undefined } as unknown as RuntimeConfig,
     async (_jid, text) => { harness.sent.push(text); }, {
-      setContactAssignment: async () => undefined,
+      setContactLabels: async () => undefined,
       renameContact: async () => undefined,
       getStatus: async () => ({ connected: true }),
-      setTyping: async (_jid, typing) => { if (typing) harness.db.setContactAssignment(jid, 'PAUSADO', 'panel-pause'); },
+      getContactLabelNames: async () => harness.db.getContactLabelNames(jid),
+      setTyping: async (_jid, typing) => { if (typing) harness.db.updateContactLabel(jid, 'bot-label', 'Bot - atendimento', false); },
     }, pino({ level: 'silent' }));
   const abort = new AbortController();
   const run = secondWorker.run(abort.signal);
@@ -239,7 +262,7 @@ test('stops before send if authorization changes during the typing indicator', a
   abort.abort();
   await run;
   assert.deepEqual(harness.sent, []);
-  assert.equal(harness.db.getContactAssignment(jid), 'PAUSADO');
+  assert.equal(harness.db.isAuthorizedForAutomation(jid), false);
 });
 
 test('Meta handoff does not send a proactive internal WhatsApp summary', async (context) => {
@@ -250,9 +273,10 @@ test('Meta handoff does not send a proactive internal WhatsApp summary', async (
   const runtime = { humanNotifyJid: '15557654321@s.whatsapp.net', whatsappProvider: 'meta' } as unknown as RuntimeConfig;
   const worker = new QualificationWorker(harness.db, provider, () => config, runtime,
     async (_jid, text) => { harness.sent.push(text); }, {
-      setContactAssignment: async () => undefined,
+      setContactLabels: async () => undefined,
       renameContact: async () => undefined,
       getStatus: async () => ({ connected: true }),
+      getContactLabelNames: async () => ['Bot - atendimento'],
     }, pino({ level: 'silent' }));
   const abort = new AbortController();
   const run = worker.run(abort.signal);
@@ -260,5 +284,4 @@ test('Meta handoff does not send a proactive internal WhatsApp summary', async (
   abort.abort();
   await run;
   assert.deepEqual(harness.sent, [config.handoffMessage]);
-  assert.equal(harness.db.getContactAssignment(jid), 'HUMANO');
 });

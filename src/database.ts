@@ -37,23 +37,6 @@ export interface QueueJob {
   attempts: number;
 }
 
-export type ContactAssignment = 'BOT' | 'HUMANO' | 'PAUSADO';
-export type ContactEligibility = 'eligible' | 'ineligible' | 'unknown';
-
-export interface ContactRecord {
-  jid: string;
-  phone: string;
-  displayName: string | null;
-  assignment: ContactAssignment;
-  eligibility: ContactEligibility;
-  firstContactObserved: boolean;
-  manualPause: boolean;
-  automationBlocked: boolean;
-  source: string;
-  updatedAt: number;
-  lastActivityAt: number | null;
-}
-
 export interface DiagnosticRecord {
   id: number;
   jid: string;
@@ -141,14 +124,8 @@ export class AgentDatabase {
       CREATE TABLE IF NOT EXISTS contacts (
         jid TEXT PRIMARY KEY,
         display_name TEXT,
-        assignment TEXT NOT NULL DEFAULT 'PAUSADO'
-          CHECK (assignment IN ('BOT', 'HUMANO', 'PAUSADO')),
-        eligibility TEXT NOT NULL DEFAULT 'unknown'
-          CHECK (eligibility IN ('eligible', 'ineligible', 'unknown')),
         first_contact_observed INTEGER NOT NULL DEFAULT 0,
-        manual_pause INTEGER NOT NULL DEFAULT 0,
-        automation_blocked INTEGER NOT NULL DEFAULT 0,
-        source TEXT NOT NULL DEFAULT 'inbound',
+        label_initialization_pending INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL,
         last_activity_at INTEGER
       );
@@ -179,19 +156,20 @@ export class AgentDatabase {
       this.db.exec('ALTER TABLE messages ADD COLUMN first_contact INTEGER NOT NULL DEFAULT 0');
     }
     const contactColumns = this.db.prepare('PRAGMA table_info(contacts)').all() as Array<{ name: string }>;
-    if (!contactColumns.some((column) => column.name === 'eligibility')) {
-      this.db.exec("ALTER TABLE contacts ADD COLUMN eligibility TEXT NOT NULL DEFAULT 'unknown'");
-      this.db.exec("UPDATE contacts SET eligibility = CASE WHEN assignment = 'BOT' THEN 'eligible' ELSE 'unknown' END");
-    }
     if (!contactColumns.some((column) => column.name === 'first_contact_observed')) {
       this.db.exec('ALTER TABLE contacts ADD COLUMN first_contact_observed INTEGER NOT NULL DEFAULT 0');
       this.db.exec('UPDATE contacts SET first_contact_observed = 1 WHERE jid IN (SELECT DISTINCT jid FROM messages WHERE first_contact = 1)');
     }
-    if (!contactColumns.some((column) => column.name === 'manual_pause')) {
-      this.db.exec('ALTER TABLE contacts ADD COLUMN manual_pause INTEGER NOT NULL DEFAULT 0');
+    if (!contactColumns.some((column) => column.name === 'label_initialization_pending')) {
+      this.db.exec('ALTER TABLE contacts ADD COLUMN label_initialization_pending INTEGER NOT NULL DEFAULT 0');
+      if (contactColumns.some((column) => column.name === 'source')) {
+        this.db.exec("UPDATE contacts SET label_initialization_pending = 1 WHERE source IN ('client-removed', 'new-lead-list-failed')");
+      }
     }
-    if (!contactColumns.some((column) => column.name === 'automation_blocked')) {
-      this.db.exec('ALTER TABLE contacts ADD COLUMN automation_blocked INTEGER NOT NULL DEFAULT 0');
+    // Retire fields from the previous local eligibility system. Native WhatsApp
+    // labels are the only authorization source; conversation data is untouched.
+    for (const column of ['eligibility', 'manual_pause', 'automation_blocked', 'assignment', 'source']) {
+      if (contactColumns.some((item) => item.name === column)) this.db.exec(`ALTER TABLE contacts DROP COLUMN ${column}`);
     }
     const outboxSql = (this.db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'outbox'").get() as { sql?: string } | undefined)?.sql ?? '';
     if (!outboxSql.includes("'unknown'")) {
@@ -221,9 +199,8 @@ export class AgentDatabase {
     }
     this.db.exec('DROP INDEX IF EXISTS outbox_pending; CREATE INDEX outbox_pending ON outbox (status, not_before, id)');
     this.db.exec("UPDATE outbox SET status = 'unknown', last_error = 'Resultado do envio desconhecido após reinício.' WHERE status = 'sending'");
-    this.db.exec("UPDATE contacts SET assignment = 'PAUSADO', automation_blocked = 1, source = 'system-unknown-send' WHERE jid IN (SELECT jid FROM outbox WHERE status = 'unknown' AND authorization_required = 1)");
     this.db.prepare(
-      "INSERT INTO diagnostics (jid, event, detail, created_at) SELECT DISTINCT outbox.jid, 'envio-incerto', 'Resultado do envio desconhecido recuperado após reinício; revisar antes de reativar.', ? FROM outbox WHERE status = 'unknown' AND authorization_required = 1 AND NOT EXISTS (SELECT 1 FROM diagnostics WHERE diagnostics.jid = outbox.jid AND diagnostics.event = 'envio-incerto' AND diagnostics.detail = 'Resultado do envio desconhecido recuperado após reinício; revisar antes de reativar.')",
+      "INSERT INTO diagnostics (jid, event, detail, created_at) SELECT DISTINCT outbox.jid, 'envio-incerto', 'Resultado do envio desconhecido recuperado após reinício; revisar antes de continuar a fila.', ? FROM outbox WHERE status = 'unknown' AND authorization_required = 1 AND NOT EXISTS (SELECT 1 FROM diagnostics WHERE diagnostics.jid = outbox.jid AND diagnostics.event = 'envio-incerto' AND diagnostics.detail = 'Resultado do envio desconhecido recuperado após reinício; revisar antes de continuar a fila.')",
     ).run(Date.now());
 
     // A process restart must not strand a job in the transient processing state.
@@ -246,79 +223,35 @@ export class AgentDatabase {
     return Boolean(this.db.prepare('SELECT 1 FROM messages WHERE jid = ? LIMIT 1').get(jid));
   }
 
-  ensureContact(jid: string, assignment: ContactAssignment = 'PAUSADO', source = 'inbound'): void {
+  ensureContact(jid: string): void {
     const now = Date.now();
-    this.db.prepare(
-      'INSERT OR IGNORE INTO contacts (jid, assignment, source, updated_at) VALUES (?, ?, ?, ?)',
-    ).run(jid, assignment, source, now);
+    this.db.prepare('INSERT OR IGNORE INTO contacts (jid, updated_at) VALUES (?, ?)').run(jid, now);
   }
 
-  setContactAssignment(jid: string, assignment: ContactAssignment, source: string): void {
-    this.ensureContact(jid, assignment, source);
-    const previous = this.getContactAssignment(jid);
-    const manualPause = assignment === 'PAUSADO' && ['panel-pause', 'panel', 'csv-import', 'manual'].includes(source);
-    this.db.prepare(
-      'UPDATE contacts SET assignment = ?, ' +
-      "eligibility = CASE WHEN ? = 'BOT' THEN 'eligible' WHEN ? IN ('new-lead', 'whatsapp-label', 'new-lead-list-failed') AND ? = 'PAUSADO' THEN 'ineligible' ELSE eligibility END, " +
-      'manual_pause = CASE WHEN ? = 1 THEN 1 WHEN ? = 1 THEN 0 ELSE manual_pause END, ' +
-      'automation_blocked = CASE WHEN ? = 1 THEN 0 ELSE automation_blocked END, source = ?, updated_at = ? WHERE jid = ?',
-    ).run(assignment, assignment, source, assignment, manualPause ? 1 : 0, assignment === 'BOT' || assignment === 'HUMANO' ? 1 : 0,
-      assignment === 'BOT' && ['panel', 'csv-import', 'manual'].includes(source) ? 1 : 0, source, Date.now(), jid);
-    if (previous !== assignment || (assignment === 'BOT' && !manualPause && ['panel', 'csv-import', 'whatsapp-label', 'new-lead'].includes(source))) {
-      this.applyAssignmentToConversation(jid, assignment);
-    }
+  markLabelInitializationPending(jid: string): void {
+    this.ensureContact(jid);
+    this.db.prepare('UPDATE contacts SET label_initialization_pending = 1, updated_at = ? WHERE jid = ?').run(Date.now(), jid);
   }
 
-  getContactAssignment(jid: string): ContactAssignment | null {
-    const row = this.db.prepare('SELECT assignment FROM contacts WHERE jid = ?').get(jid) as { assignment: ContactAssignment } | undefined;
-    return row?.assignment ?? null;
+  needsLabelInitialization(jid: string): boolean {
+    const row = this.db.prepare('SELECT label_initialization_pending FROM contacts WHERE jid = ?').get(jid) as { label_initialization_pending: number } | undefined;
+    return row?.label_initialization_pending === 1;
   }
 
-  getContactEligibility(jid: string): ContactEligibility {
-    const row = this.db.prepare('SELECT eligibility FROM contacts WHERE jid = ?').get(jid) as { eligibility: ContactEligibility } | undefined;
-    return row?.eligibility ?? 'unknown';
+  clearLabelInitializationPending(jid: string): void {
+    this.db.prepare('UPDATE contacts SET label_initialization_pending = 0, updated_at = ? WHERE jid = ?').run(Date.now(), jid);
   }
 
-  isManualPause(jid: string): boolean {
-    const row = this.db.prepare('SELECT manual_pause FROM contacts WHERE jid = ?').get(jid) as { manual_pause: number } | undefined;
-    return row?.manual_pause === 1;
+  getContactsAwaitingLabelInitialization(): string[] {
+    return (this.db.prepare('SELECT jid FROM contacts WHERE label_initialization_pending = 1 ORDER BY updated_at, jid').all() as Array<{ jid: string }>).map(({ jid }) => jid);
   }
 
-  isAutomationBlocked(jid: string): boolean {
-    const row = this.db.prepare('SELECT automation_blocked FROM contacts WHERE jid = ?').get(jid) as { automation_blocked: number } | undefined;
-    return row?.automation_blocked === 1;
-  }
-
-  blockAutomation(jid: string, source: string, assignment: ContactAssignment = 'PAUSADO'): void {
-    this.ensureContact(jid, 'PAUSADO', source);
-    const previous = this.getContactAssignment(jid);
-    this.db.prepare('UPDATE contacts SET assignment = ?, automation_blocked = 1, source = ?, updated_at = ? WHERE jid = ?')
-      .run(assignment, source, Date.now(), jid);
-    if (previous !== assignment) this.applyAssignmentToConversation(jid, assignment);
+  getContactsWithUnprocessedMessages(): string[] {
+    return (this.db.prepare("SELECT DISTINCT jid FROM messages WHERE direction = 'inbound' AND processed_at IS NULL ORDER BY jid").all() as Array<{ jid: string }>).map(({ jid }) => jid);
   }
 
   isAuthorizedForAutomation(jid: string): boolean {
-    if (this.getContactAssignment(jid) !== 'BOT' || this.getContactEligibility(jid) !== 'eligible' || this.isManualPause(jid) || this.isAutomationBlocked(jid)) return false;
-    const state = this.getConversationState(jid);
-    return !state.paused && !state.completed;
-  }
-
-  syncRemoteAssignment(jid: string, remote: ContactAssignment): ContactAssignment {
-    this.ensureContact(jid, 'PAUSADO', 'whatsapp-label');
-    const manualPause = this.isManualPause(jid);
-    const automationBlocked = this.isAutomationBlocked(jid);
-    const previous = this.getContactAssignment(jid);
-    const assignment: ContactAssignment = remote === 'HUMANO' ? 'HUMANO' : remote === 'BOT' && !manualPause && !automationBlocked ? 'BOT' : 'PAUSADO';
-    this.db.prepare(
-      "UPDATE contacts SET assignment = ?, eligibility = ?, source = 'whatsapp-label', updated_at = ? WHERE jid = ?",
-    ).run(assignment, remote === 'BOT' ? 'eligible' : 'ineligible', Date.now(), jid);
-    if (previous !== assignment) this.applyAssignmentToConversation(jid, assignment);
-    return assignment;
-  }
-
-  hasExplicitBotAssignment(jid: string): boolean {
-    const row = this.db.prepare('SELECT assignment, source FROM contacts WHERE jid = ?').get(jid) as { assignment: ContactAssignment; source: string } | undefined;
-    return row?.assignment === 'BOT' && ['panel', 'csv-import', 'whatsapp-label', 'new-lead'].includes(row.source);
+    return this.hasContactLabel(jid, 'Bot - atendimento') && !this.hasContactLabel(jid, 'Clientes');
   }
 
   getLabelIdByName(name: string): string | undefined {
@@ -327,15 +260,18 @@ export class AgentDatabase {
   }
 
   saveLabel(id: string, name: string, color = 0, deleted = false): string[] {
+    const affected = this.db.prepare('SELECT DISTINCT jid FROM contact_labels WHERE label_id = ?').all(id) as Array<{ jid: string }>;
+    const previouslyAuthorized = new Map(affected.map(({ jid }) => [jid, this.isAuthorizedForAutomation(jid)]));
     this.db.prepare(
       'INSERT INTO wa_labels (id, name, color, deleted) VALUES (?, ?, ?, ?) ' +
       'ON CONFLICT(id) DO UPDATE SET name = excluded.name, color = excluded.color, deleted = excluded.deleted',
     ).run(id, name, color, deleted ? 1 : 0);
-    const affected = this.db.prepare('SELECT DISTINCT jid FROM contact_labels WHERE label_id = ?').all(id) as Array<{ jid: string }>;
     const newlyBotAssigned: string[] = [];
     for (const contact of affected) {
-      const result = this.recalculateContactAssignment(contact.jid);
-      if (result.assignment === 'BOT' && result.previous !== 'BOT') newlyBotAssigned.push(contact.jid);
+      const wasAuthorized = previouslyAuthorized.get(contact.jid) ?? false;
+      const authorized = this.isAuthorizedForAutomation(contact.jid);
+      if (wasAuthorized !== authorized) this.applyAuthorizationToConversation(contact.jid, authorized);
+      if (!wasAuthorized && authorized) newlyBotAssigned.push(contact.jid);
     }
     return newlyBotAssigned;
   }
@@ -345,9 +281,18 @@ export class AgentDatabase {
     return row?.name;
   }
 
-  updateContactLabel(jid: string, labelId: string, name: string, add: boolean): void {
+  hasContactLabel(jid: string, name: string): boolean {
+    return Boolean(this.db.prepare('SELECT 1 FROM contact_labels cl JOIN wa_labels l ON l.id = cl.label_id WHERE cl.jid = ? AND lower(trim(l.name)) = lower(trim(?)) AND l.deleted = 0').get(jid, name));
+  }
+
+  getContactLabelNames(jid: string): string[] {
+    return (this.db.prepare('SELECT l.name FROM contact_labels cl JOIN wa_labels l ON l.id = cl.label_id WHERE cl.jid = ? AND l.deleted = 0 ORDER BY l.name').all(jid) as Array<{ name: string }>).map((row) => row.name);
+  }
+
+  updateContactLabel(jid: string, labelId: string, name: string, add: boolean): { authorized: boolean; newlyAuthorized: boolean } {
     if (!this.getLabelName(labelId)) this.saveLabel(labelId, name);
-    this.ensureContact(jid, 'PAUSADO', 'whatsapp-label');
+    this.ensureContact(jid);
+    const wasAuthorized = this.isAuthorizedForAutomation(jid);
     const transaction = this.db.transaction(() => {
       if (add) {
         this.db.prepare('INSERT OR IGNORE INTO contact_labels (jid, label_id) VALUES (?, ?)').run(jid, labelId);
@@ -356,27 +301,15 @@ export class AgentDatabase {
       }
     });
     transaction.immediate();
-    this.recalculateContactAssignment(jid);
+    const authorized = this.isAuthorizedForAutomation(jid);
+    if (wasAuthorized !== authorized) this.applyAuthorizationToConversation(jid, authorized);
     this.recordDiagnostic(jid, 'etiqueta', `${add ? 'Adicionada' : 'Removida'}: ${name}`);
+    return { authorized, newlyAuthorized: !wasAuthorized && authorized };
   }
 
-  private recalculateContactAssignment(jid: string): { previous: ContactAssignment | null; assignment: ContactAssignment } {
-    const names = this.db.prepare(
-      'SELECT upper(l.name) AS name FROM contact_labels cl JOIN wa_labels l ON l.id = cl.label_id ' +
-      'WHERE cl.jid = ? AND l.deleted = 0',
-    ).all(jid) as Array<{ name: string }>;
-    const normalized = names.map((label) => label.name.trim().toLocaleLowerCase('pt-BR'));
-    const remoteAssignment: ContactAssignment = normalized.some((name) => name === 'atendimento' || name === 'humano')
-      ? 'HUMANO'
-      : normalized.some((name) => name === 'bot - atendimento') ? 'BOT' : 'PAUSADO';
-    const previous = this.getContactAssignment(jid);
-    const assignment = this.syncRemoteAssignment(jid, remoteAssignment);
-    return { previous, assignment };
-  }
-
-  private applyAssignmentToConversation(jid: string, assignment: ContactAssignment): void {
+  private applyAuthorizationToConversation(jid: string, authorized: boolean): void {
     const state = this.getConversationState(jid);
-    if (assignment === 'BOT') {
+    if (authorized) {
       state.paused = false;
       state.completed = false;
     } else {
@@ -388,18 +321,6 @@ export class AgentDatabase {
   setContactName(jid: string, name: string): void {
     this.ensureContact(jid);
     this.db.prepare('UPDATE contacts SET display_name = ?, updated_at = ? WHERE jid = ?').run(name, Date.now(), jid);
-  }
-
-  listContacts(): ContactRecord[] {
-    return this.db.prepare(
-      'SELECT jid, replace(replace(jid, \'@s.whatsapp.net\', \'\'), \'@lid\', \'\') AS phone, ' +
-      'display_name AS displayName, assignment, eligibility, first_contact_observed AS firstContactObserved, ' +
-      'manual_pause AS manualPause, automation_blocked AS automationBlocked, source, updated_at AS updatedAt, last_activity_at AS lastActivityAt ' +
-      'FROM contacts ORDER BY coalesce(last_activity_at, updated_at) DESC LIMIT 1000',
-    ).all().map((row) => {
-      const contact = row as Omit<ContactRecord, 'firstContactObserved' | 'manualPause' | 'automationBlocked'> & { firstContactObserved: number; manualPause: number; automationBlocked: number };
-      return { ...contact, firstContactObserved: Boolean(contact.firstContactObserved), manualPause: Boolean(contact.manualPause), automationBlocked: Boolean(contact.automationBlocked) };
-    }) as ContactRecord[];
   }
 
   setContactActivity(jid: string, at: number): void {
@@ -415,16 +336,19 @@ export class AgentDatabase {
   }
 
   queueConversationStart(jid: string): boolean {
-    if (!this.isAuthorizedForAutomation(jid) || this.getUnprocessedMessages(jid).length === 0) return false;
-    const active = this.db.prepare(
-      "SELECT 1 FROM jobs WHERE jid = ? AND kind = 'process_conversation' AND status IN ('pending', 'processing') LIMIT 1",
-    ).get(jid);
-    if (active) return false;
+    if (this.getUnprocessedMessages(jid).length === 0) return false;
     const now = Date.now();
+    const active = this.db.prepare(
+      "SELECT id, status, last_error AS lastError FROM jobs WHERE jid = ? AND kind = 'process_conversation' AND status IN ('pending', 'processing') LIMIT 1",
+    ).get(jid) as { id: number; status: 'pending' | 'processing'; lastError: string | null } | undefined;
+    if (active) {
+      if (active.status === 'pending' && active.lastError) this.db.prepare('UPDATE jobs SET not_before = ?, updated_at = ? WHERE id = ?').run(now, now, active.id);
+      return false;
+    }
     this.db.prepare(
       "INSERT INTO jobs (jid, kind, status, not_before, created_at, updated_at) VALUES (?, 'process_conversation', 'pending', ?, ?, ?)",
     ).run(jid, now, now, now);
-    this.recordDiagnostic(jid, 'na-fila', 'Mensagem pendente liberada após autorização explícita; nenhuma mensagem é iniciada sem contato prévio.');
+    this.recordDiagnostic(jid, 'na-fila', 'Mensagem recebida liberada após confirmação das listas atuais.');
     return true;
   }
 
@@ -478,7 +402,7 @@ export class AgentDatabase {
       // Duplicate socket events are harmless and do not reschedule a reply.
       if (inserted.changes === 0) return false;
 
-      this.ensureContact(message.jid, 'PAUSADO', 'inbound');
+      this.ensureContact(message.jid);
       const firstContact = Boolean((this.db.prepare('SELECT first_contact FROM messages WHERE message_key = ?').get(message.key) as { first_contact: number } | undefined)?.first_contact);
       this.db.prepare(
         'UPDATE contacts SET first_contact_observed = CASE WHEN ? = 1 THEN 1 ELSE first_contact_observed END, last_activity_at = ?, updated_at = ? WHERE jid = ?',

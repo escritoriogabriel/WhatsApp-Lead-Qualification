@@ -41,7 +41,7 @@ class MetaCloudApiAdapter {
   connection(): WhatsAppConnection {
     return {
       sendText: (jid, text) => this.sendText(jid, text),
-      setContactAssignment: async () => undefined,
+      setContactLabels: async () => undefined,
       renameContact: async () => undefined,
       handleWebhook: (body) => this.handleWebhook(body),
       getStatus: async () => ({ provider: 'meta', state: 'CONFIGURED', connected: true }),

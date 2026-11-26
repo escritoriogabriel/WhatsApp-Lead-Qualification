@@ -4,7 +4,6 @@ import type { AssistantConfig, IntakeProfile, RuntimeConfig } from './config.js'
 import type { IntakeAIProvider } from './ai.js';
 import {
   AgentDatabase,
-  type ContactAssignment,
   type ConversationState,
   type OutboundRateLimits,
   type QueueJob,
@@ -12,6 +11,7 @@ import {
 } from './database.js';
 import { GeminiQuotaError } from './gemini.js';
 import { ProviderRetryAfterError, SendOutcomeUnknownError } from './provider-errors.js';
+import type { WhatsAppLabelTarget } from './whatsapp.js';
 
 const MAX_JOB_ATTEMPTS = 5;
 
@@ -19,11 +19,18 @@ export interface TextSender {
   (jid: string, text: string): Promise<void>;
 }
 
+export class LabelAuthorizationUnavailableError extends Error {
+  constructor() {
+    super('Não foi possível consultar as listas atuais do WhatsApp.');
+    this.name = 'LabelAuthorizationUnavailableError';
+  }
+}
+
 export interface ContactManager {
-  setContactAssignment(jid: string, assignment: ContactAssignment): Promise<void>;
+  setContactLabels(jid: string, target: WhatsAppLabelTarget): Promise<void>;
+  getContactLabelNames?: ((jid: string) => Promise<string[]>) | undefined;
   setTyping?: ((jid: string, typing: boolean) => Promise<void>) | undefined;
   renameContact(jid: string, name: string): Promise<void>;
-  getContactAssignment?: ((jid: string) => Promise<ContactAssignment>) | undefined;
   getStatus?(): Promise<{ connected: boolean }>;
 }
 
@@ -73,6 +80,12 @@ export class QualificationWorker {
       this.db.completeJob(job.id);
       this.db.recordDiagnostic(job.jid, 'processada', `Tarefa ${job.id} concluída`);
     } catch (error) {
+      if (error instanceof LabelAuthorizationUnavailableError) {
+        this.db.deferJob(job.id, 60_000, error.message);
+        this.db.recordDiagnostic(job.jid, 'aguardando-listas', 'Consulta das listas indisponível; mensagem mantida pendente sem resposta e nova tentativa agendada.');
+        this.logger.warn({ jobId: job.id }, 'Native label query unavailable; conversation deferred');
+        return;
+      }
       if (error instanceof GeminiQuotaError) {
         this.db.deferJob(job.id, error.retryAfterMs, error.message);
         const resumesAt = new Date(Date.now() + error.retryAfterMs).toLocaleString('pt-BR');
@@ -105,7 +118,7 @@ export class QualificationWorker {
 
   private async startConversation(job: QueueJob): Promise<void> {
     if (this.db.getUnprocessedMessages(job.jid).length === 0) {
-      this.db.recordDiagnostic(job.jid, 'ignorada', 'A atribuição sozinha não inicia uma mensagem; aguarda-se uma mensagem recebida.');
+      this.db.recordDiagnostic(job.jid, 'ignorada', 'A alteração de listas sozinha não inicia uma conversa; aguarda-se uma mensagem recebida.');
       return;
     }
     await this.processConversation(job);
@@ -117,7 +130,7 @@ export class QualificationWorker {
 
     const state = this.db.getConversationState(job.jid);
     if (!(await this.isAuthorized(job.jid))) {
-      this.db.recordDiagnostic(job.jid, 'aguardando-autorizacao', 'Mensagem pendente preservada; elegibilidade ou estado do atendimento não autorizou resposta.');
+      this.db.recordDiagnostic(job.jid, 'aguardando-autorizacao', 'Mensagem pendente preservada porque as listas atuais não autorizam a resposta.');
       return;
     }
     if (state.externalDisclosureAfterMessageId !== null) {
@@ -140,7 +153,7 @@ export class QualificationWorker {
         await this.deliver(job, job.jid, [this.assistant.urgencyMessage], 'urgency-client');
         state.paused = true;
         this.db.saveConversationState(job.jid, state);
-        await this.assignContact(job.jid, 'HUMANO', 'urgency');
+        await this.setContactLabels(job.jid, 'HUMANO');
         await this.notifyHuman(job, job.jid, state, 'Palavra de urgência detectada', historyBeforeDisclosure);
         this.db.markMessagesProcessed(incoming.map((message) => message.id));
         return;
@@ -247,7 +260,7 @@ export class QualificationWorker {
       );
       state.paused = true;
       this.db.saveConversationState(job.jid, state);
-      await this.assignContact(job.jid, 'HUMANO', 'urgency');
+      await this.setContactLabels(job.jid, 'HUMANO');
       await this.notifyHuman(job, job.jid, state, 'Palavra de urgência detectada');
       this.db.markMessagesProcessed(incoming.map((message) => message.id));
       return;
@@ -356,7 +369,7 @@ export class QualificationWorker {
       state.completed = true;
       state.paused = true;
       this.db.saveConversationState(job.jid, state);
-      await this.assignContact(job.jid, 'HUMANO', 'completion');
+      await this.setContactLabels(job.jid, 'HUMANO');
       await this.notifyHuman(job, job.jid, state, 'Triagem concluída');
     } else {
       const areaUnknown = firstTurn && !state.fields[this.assistant.areaFieldId];
@@ -414,7 +427,7 @@ export class QualificationWorker {
     await this.deliver(job, jid, [clientMessage], 'handoff-client');
     state.paused = true;
     this.db.saveConversationState(jid, state);
-    await this.assignContact(jid, 'HUMANO', 'handoff');
+    await this.setContactLabels(jid, 'HUMANO');
     await this.notifyHuman(job, jid, state, reason, history);
   }
 
@@ -467,32 +480,27 @@ export class QualificationWorker {
     );
   }
 
-  private async assignContact(jid: string, assignment: ContactAssignment, source: string): Promise<void> {
+  private async setContactLabels(jid: string, target: WhatsAppLabelTarget): Promise<void> {
     try {
-      await this.contacts.setContactAssignment(jid, assignment);
+      await this.contacts.setContactLabels(jid, target);
     } catch {
-      this.logger.warn({ assignment }, 'Falha ao sincronizar a atribuição com o WhatsApp; o estado local mantém a automação bloqueada.');
-      this.db.recordDiagnostic(jid, 'falha-lista', 'Falha ao sincronizar a atribuição com o WhatsApp.');
-      this.db.blockAutomation(jid, 'system-assignment-sync', assignment);
+      this.logger.warn({ target }, 'Falha ao sincronizar as listas nativas do WhatsApp.');
+      this.db.recordDiagnostic(jid, 'falha-lista', 'Falha ao sincronizar as listas do WhatsApp.');
       return;
     }
-    this.db.setContactAssignment(jid, assignment, source);
   }
 
   private async isAuthorized(jid: string): Promise<boolean> {
-    if (!this.db.isAuthorizedForAutomation(jid)) return false;
     try {
-      if (this.contacts.getStatus && !(await this.contacts.getStatus()).connected) return false;
-      if (this.contacts.getContactAssignment) {
-        const remote = await this.contacts.getContactAssignment(jid);
-        const local = this.db.syncRemoteAssignment(jid, remote);
-        if (local !== 'BOT') return false;
-      }
-      return this.db.isAuthorizedForAutomation(jid);
-    } catch {
-      this.db.recordDiagnostic(jid, 'falha-sincronizacao', 'Não foi possível confirmar a elegibilidade no WhatsApp; envio bloqueado.');
-      this.logger.warn('Não foi possível confirmar a elegibilidade no WhatsApp; envio bloqueado.');
-      return false;
+      if (this.contacts.getStatus && !(await this.contacts.getStatus()).connected) throw new LabelAuthorizationUnavailableError();
+      if (!this.contacts.getContactLabelNames) throw new LabelAuthorizationUnavailableError();
+      const names = (await this.contacts.getContactLabelNames(jid)).map((name) => name.trim().toLocaleLowerCase('pt-BR'));
+      return names.includes('bot - atendimento') && !names.includes('clientes');
+    } catch (error) {
+      this.db.recordDiagnostic(jid, 'falha-sincronizacao', 'Não foi possível consultar as listas do WhatsApp; envio bloqueado e mensagem preservada.');
+      this.logger.warn('Não foi possível consultar as listas do WhatsApp; envio bloqueado.');
+      if (error instanceof LabelAuthorizationUnavailableError) throw error;
+      throw new LabelAuthorizationUnavailableError();
     }
   }
 
@@ -560,7 +568,7 @@ export class QualificationWorker {
   private async flushOutbox(): Promise<void> {
     for (const item of this.db.pendingOutbox()) {
       if (item.authorizationRequired && !(await this.isAuthorized(item.jid))) {
-        this.db.markOutboundBlocked(item.id, 'Elegibilidade não confirmada na retomada da fila.');
+        this.db.markOutboundBlocked(item.id, 'Listas do WhatsApp não confirmadas na retomada da fila.');
         this.db.recordDiagnostic(item.jid, 'envio-bloqueado', 'Uma mensagem pendente foi bloqueada após mudança de autorização.');
         continue;
       }
@@ -570,20 +578,18 @@ export class QualificationWorker {
 
   private async sendOutboxItem(item: { id: number; jid: string; body: string; authorizationRequired: boolean; attempts?: number }): Promise<void> {
     if (item.authorizationRequired && !(await this.isAuthorized(item.jid))) {
-      this.db.markOutboundBlocked(item.id, 'Elegibilidade não confirmada antes do envio.');
+      this.db.markOutboundBlocked(item.id, 'Listas do WhatsApp não confirmadas antes do envio.');
       return;
     }
     if ((item.attempts ?? 0) >= MAX_JOB_ATTEMPTS) {
       this.db.markOutboundBlocked(item.id, 'Limite de tentativas do envio atingido.');
-      if (item.authorizationRequired) this.db.blockAutomation(item.jid, 'system-send-retries');
       this.db.recordDiagnostic(item.jid, 'fila-falha', 'Envio bloqueado após o limite de tentativas; requer revisão humana.');
       return;
     }
     const rateLimit = this.db.outboundLimitReason(item.jid, this.outboundRateLimits(), item.authorizationRequired, item.id);
     if (rateLimit) {
       this.db.markOutboundBlocked(item.id, rateLimit);
-      if (item.authorizationRequired) this.db.blockAutomation(item.jid, 'system-rate-limit');
-      this.db.recordDiagnostic(item.jid, 'limite-envio', rateLimit + ' A automação foi pausada para revisão.');
+      this.db.recordDiagnostic(item.jid, 'limite-envio', rateLimit + ' Mensagem bloqueada para revisão.');
       return;
     }
     await this.prepareTyping(item);
@@ -600,7 +606,6 @@ export class QualificationWorker {
     } catch (error) {
       if (error instanceof SendOutcomeUnknownError) {
         this.db.markOutboundUnknown(item.id, 'O provedor não confirmou o resultado do envio.');
-        if (item.authorizationRequired) this.db.blockAutomation(item.jid, 'system-unknown-send');
         this.db.recordDiagnostic(item.jid, 'envio-incerto', 'Resultado do envio desconhecido; não haverá repetição automática. Revisão humana necessária.');
         return;
       }
@@ -612,7 +617,6 @@ export class QualificationWorker {
       const nextAttempt = (item.attempts ?? 0) + 1;
       if (nextAttempt >= MAX_JOB_ATTEMPTS) {
         this.db.markOutboundBlocked(item.id, 'Falha confirmada após o limite de tentativas.');
-        if (item.authorizationRequired) this.db.blockAutomation(item.jid, 'system-send-retries');
         this.db.recordDiagnostic(item.jid, 'fila-falha', 'Envio bloqueado após falha confirmada; revisão humana necessária.');
         return;
       }

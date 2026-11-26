@@ -2,7 +2,7 @@ const byId = (id) => document.getElementById(id);
 const app = byId('app');
 const login = byId('login');
 const content = byId('content');
-const TITLES = { overview:'Visão geral', behavior:'Comportamento', flow:'Fluxos e perguntas', messages:'Mensagens', knowledge:'Instruções e materiais', preview:'Testar conversa', whatsapp:'Conexão WhatsApp', contacts:'Contatos e listas', diagnostics:'Fila e diagnósticos' };
+const TITLES = { overview:'Visão geral', flow:'Fluxos e perguntas', messages:'Mensagens', knowledge:'Instruções e materiais', preview:'Testar conversa', whatsapp:'Conexão WhatsApp', contacts:'Regras das listas', diagnostics:'Fila e diagnósticos' };
 let config = null;
 let page = 'overview';
 let profileIndex = 0;
@@ -39,7 +39,6 @@ function render() {
   byId('page-title').textContent = TITLES[page];
   document.querySelectorAll('.nav-item').forEach((item)=>item.classList.toggle('active',item.dataset.page===page));
   if(page==='overview') renderOverview();
-  if(page==='behavior') renderBehavior();
   if(page==='flow') renderFlow();
   if(page==='messages') renderMessages();
   if(page==='knowledge') renderKnowledge();
@@ -60,13 +59,13 @@ function render() {
   });
   content.querySelectorAll('[data-list-path]').forEach((el)=>el.addEventListener('input',()=>{setPath(el.dataset.listPath,parseList(el.value));}));
   content.querySelectorAll('[data-action]').forEach((el)=>el.addEventListener('click',()=>action(el.dataset.action,el.dataset.index)));
-  content.querySelectorAll('[data-contact-assignment]').forEach((el)=>el.addEventListener('change',()=>updateContact(el.dataset.jid,el.value)));
+  content.querySelectorAll('[data-page]').forEach((el)=>el.addEventListener('click',()=>{page=el.dataset.page;render();}));
 }
 
 function renderWhatsApp() {
   content.innerHTML=heading('OPERAÇÃO','Conexão WhatsApp','Acompanhe a sessão usada pelo agente, faça o pareamento e confira o mecanismo de integração.')+
     `<div class="grid two"><div class="card"><div class="card-title-row"><h2>Estado da sessão</h2><span id="whatsapp-status-badge" class="pill">Consultando…</span></div><p id="whatsapp-status-detail" class="card-description">Consultando o provedor configurado…</p><div class="status-actions"><button class="button small" data-action="refresh-whatsapp">Atualizar estado</button><button id="whatsapp-restart" class="button small danger hidden" data-action="restart-whatsapp">Reiniciar sessão</button></div><div id="whatsapp-provider-help" class="notice">A leitura do status pode levar alguns segundos.</div></div><div id="whatsapp-qr-card" class="card hidden"><h2>Parear este número</h2><p class="card-description">No WhatsApp do número que será usado: <b>Aparelhos conectados → Conectar aparelho</b>. Escaneie o QR abaixo.</p><div id="whatsapp-qr-wrap" class="qr-wrap"><img id="whatsapp-qr" alt="QR de pareamento da sessão WhatsApp" /></div><p class="help">O QR é temporário e só é exibido para quem entrou no painel. Se expirar, atualize o estado para gerar outro.</p></div></div><div class="notice section-card">WAHA, assim como Baileys, conecta pelo protocolo do WhatsApp Web e não é a API oficial da Meta. Use um número de teste e considere o risco de desconexão ou restrição da conta.</div>`;
-  content.innerHTML+=`<div class="card section-card"><h2>Provedor WhatsApp</h2><p class="card-description">A alteração salva a configuração e troca a conexão ativa. Os segredos permanecem no ambiente do servidor.</p>${select('Integração','whatsappProvider',config.whatsappProvider,[['meta','Meta Cloud API (oficial)'],['waha','WAHA (teste/local)'],['baileys','Baileys (legado)']],'Meta exige credenciais e webhook público HTTPS. WAHA e Baileys usam sessão WhatsApp Web. A elegibilidade é interna na Meta e baseada em listas no WAHA/Baileys.')}</div>`;
+  content.innerHTML+=`<div class="card section-card"><h2>Provedor WhatsApp</h2><p class="card-description">Este fluxo exige etiquetas nativas e funciona com Baileys ou WAHA.</p>${select('Integração','whatsappProvider',config.whatsappProvider,[['waha','WAHA'],['baileys','Baileys']],'As listas Novo Lead, Bot - atendimento e Clientes são mantidas no próprio WhatsApp.')}</div>`;
   void refreshWhatsAppStatus();
   whatsappPoller=setInterval(()=>void refreshWhatsAppStatus(),5000);
 }
@@ -78,9 +77,9 @@ async function refreshWhatsAppStatus() {
     const status=await api('/api/whatsapp/status');
     const state=String(status.state||'UNKNOWN').toUpperCase();
     const provider=status.provider==='waha'?'WAHA':status.provider==='meta'?'Meta Cloud API':'Baileys';
-    const names={WORKING:'Conectado',CONFIGURED:'Configurado · sem teste de saúde',SCAN_QR_CODE:'Aguardando leitura do QR',STARTING:'Iniciando',STOPPED:'Parado',FAILED:'Falha na sessão',DISCONNECTED:'Desconectado',INITIALIZING:'Inicializando'};
+    const names={WORKING:'Conectado',SYNCING_LABELS:'Sincronizando listas',CONFIGURED:'Configurado · sem teste de saúde',SCAN_QR_CODE:'Aguardando leitura do QR',STARTING:'Iniciando',STOPPED:'Parado',FAILED:'Falha na sessão',DISCONNECTED:'Desconectado',INITIALIZING:'Inicializando'};
     badge.textContent=names[state]||state;
-    badge.classList.toggle('status-online',Boolean(status.connected)&&state!=='CONFIGURED');
+    badge.classList.toggle('status-online',Boolean(status.connected)&&status.labelsReady!==false&&state!=='CONFIGURED');
     const details=[provider,status.session?`sessão ${status.session}`:'',status.engine?`mecanismo ${status.engine}`:'',status.account?`conta ${status.account}`:''].filter(Boolean).join(' · ');
     byId('whatsapp-status-detail').textContent=details;
     const help=byId('whatsapp-provider-help');
@@ -93,8 +92,9 @@ async function refreshWhatsAppStatus() {
     }else{
       qrCard.classList.add('hidden');
       byId('whatsapp-qr').removeAttribute('src');
-      if(status.provider==='baileys')help.textContent='Baileys está ativo. O QR de primeiro pareamento é exibido no terminal que iniciou a aplicação.';
-      else if(status.provider==='meta')help.textContent='Meta Cloud API configurada. O provedor não usa QR nem etiquetas; a elegibilidade é controlada pela lista interna deste painel.';
+      if(status.provider==='baileys'&&state==='SYNCING_LABELS')help.textContent='A sessão conectou, mas as listas nativas ainda estão sincronizando. O bot não responde até confirmar essa leitura; falhas serão repetidas automaticamente.';
+      else if(status.provider==='baileys')help.textContent='Baileys está ativo e as listas nativas foram sincronizadas. O QR de primeiro pareamento é exibido no terminal que iniciou a aplicação.';
+      else if(status.provider==='meta')help.textContent='Meta Cloud API não sincroniza as listas nativas exigidas. Selecione WAHA ou Baileys para usar a triagem.';
       else if(state==='WORKING')help.textContent='A sessão está ativa. O agente pode receber mensagens, transcrever áudio e aplicar etiquetas conforme as instruções configuradas.';
       else if(state==='FAILED'||state==='STOPPED')help.textContent='A sessão não está ativa. Consulte os logs do WAHA e, se necessário, reinicie a sessão.';
       else help.textContent='A sessão ainda está iniciando ou reconectando. O painel atualizará este estado automaticamente.';
@@ -109,21 +109,6 @@ async function refreshWhatsAppStatus() {
     byId('whatsapp-restart').classList.add('hidden');
     byId('whatsapp-qr').removeAttribute('src');
   }
-}
-
-function renderOverview() {
-  const profile=config.profiles.find((item)=>item.id===config.defaultProfileId) || config.profiles[0];
-  content.innerHTML=heading('SEU ATENDIMENTO','Uma recepção clara, do primeiro oi ao encaminhamento.','Configure o jeito de conversar, as perguntas e os limites do agente. As mudanças são aplicadas sem reiniciar o serviço.')+
-    `<div class="grid three"><div class="card stat-card"><div class="stat-label">ÁREA DE ATENDIMENTO</div><div class="stat-value">${escapeHtml(profile.label)}</div><div class="stat-note">Fluxo padrão selecionado</div></div><div class="card stat-card"><div class="stat-label">PERGUNTAS CONFIGURADAS</div><div class="stat-value">${profile.fields.length}</div><div class="stat-note">Em ${config.profiles.length} fluxo(s)</div></div><div class="card stat-card"><div class="stat-label">MENSAGENS POR VEZ</div><div class="stat-value">Até ${config.maxMessagesPerTurn}</div><div class="stat-note">Com pausa entre os balões</div></div></div>`+
-    `<div class="grid two section-card"><div class="card"><div class="card-title-row"><h2>Ritmo do atendimento</h2><span class="pill">WhatsApp</span></div><p class="card-description">Responda somente a mensagens recebidas e com autorização confirmada.</p>${select('Primeira mensagem recebida','firstMessagePolicy',config.firstMessagePolicy,[['explicit','Aguardar inclusão explícita na lista Bot'],['auto','Iniciar triagem automaticamente']],'O modo automático só inicia após a primeira mensagem recebida. Atribuir uma lista nunca dispara campanha.')}${toggle('Simular “escrevendo…”','simulateTyping',config.simulateTyping,'Mostra presença de digitação antes de enviar cada balão, quando o provedor oferece esse recurso.')}</div><div class="card"><div class="card-title-row"><h2>Proteção do atendimento</h2><span class="pill">Controle do escritório</span></div><p class="card-description">O agente faz apenas acolhimento e coleta inicial; não presta orientação jurídica individual.</p><div class="notice green">O assistente se identifica, pede somente os dados configurados e interrompe a triagem quando precisa de avaliação humana.</div><button class="button section-card" data-action="goto-behavior">Revisar comportamento →</button></div></div>`;
-}
-
-function renderBehavior() {
-  content.innerHTML=heading('COMPORTAMENTO','Defina o ritmo e os limites.','Ajuste a espera, a simulação de digitação, o tamanho das mensagens e a quem o agente responde.')+
-    `<div class="grid two"><div class="card"><h2>Quem recebe resposta</h2><p class="card-description">O estado BOT, a elegibilidade e a sincronização precisam estar confirmados. HUMANO e PAUSADO sempre prevalecem.</p>${select('Primeira mensagem recebida','firstMessagePolicy',config.firstMessagePolicy,[['explicit','Aguardar inclusão explícita na lista Bot'],['auto','Iniciar triagem automaticamente']],'Uma mensagem nova não remove pausa manual. A inclusão em Bot nunca inicia conversa sem mensagem recebida.')}${select('Provedor de IA','aiProvider',config.aiProvider,[['ollama','Ollama local'],['gemini','Gemini externo']],'Ollama é a opção padrão local; Gemini envia as mensagens necessárias à extração ao Google.')}${select('Transcrição de áudio','audioTranscriptionProvider',config.audioTranscriptionProvider,[['disabled','Desativada'],['gemini','Gemini externo']],'Com Gemini, o áudio será transmitido para transcrição; o padrão mantém áudio desativado.')}</div><div class="card"><h2>Presença</h2><p class="card-description">Use somente os recursos disponíveis no provedor ativo.</p>${toggle('Mostrar “escrevendo…”','simulateTyping',config.simulateTyping,'WAHA e Baileys podem exibir presença de digitação; Meta Cloud API não oferece esse recurso no adaptador atual.')}${numberInput('Tempo de digitação por caractere (segundos)','typingSecondsPerCharacter',config.typingSecondsPerCharacter,0,null,'Usado pelos provedores que oferecem presença de digitação.','any')}<div class="notice">Mantenha aviso de privacidade atualizado antes de selecionar qualquer provedor externo.</div></div></div>`+
-    `<div class="card section-card"><h2>Cadência, limites e retenção</h2><p class="card-description">Defina esperas, janela de agrupamento, cota de mensagens e prazo de retenção.</p><div class="field-grid">${numberInput('Aguardar para agrupar mensagens (segundos)','batchWindowSeconds',config.batchWindowSeconds,0,null,'A janela reinicia quando chegam novas mensagens da mesma conversa.','any')}${numberInput('Intervalo entre balões do bot (segundos)','sendPartDelaySeconds',config.sendPartDelaySeconds,0,null,'Pausa entre uma mensagem do bot e a seguinte.','any')}${numberInput('Intervalo mínimo por contato (segundos)','minSecondsBetweenContactMessages',config.minSecondsBetweenContactMessages,0,null,'Limita a cadência de envios ao mesmo contato.','any')}${numberInput('Máximo por contato em 24 horas','maxMessagesPerContactPerDay',config.maxMessagesPerContactPerDay,1,100000)}${numberInput('Máximo por contato em 30 dias','maxMessagesPerContactPerMonth',config.maxMessagesPerContactPerMonth,1,1000000)}${numberInput('Máximo total em 24 horas','maxMessagesSentPerDay',config.maxMessagesSentPerDay,1,1000000)}${numberInput('Máximo total em 30 dias','maxMessagesSentPerMonth',config.maxMessagesSentPerMonth,1,10000000)}${numberInput('Caracteres máximos por balão','maxCharsPerMessage',config.maxCharsPerMessage,80,4000,'O sistema limita cada balão sem pedir ao modelo para contornar limites do provedor.')}${numberInput('Máximo de balões por resposta','maxMessagesPerTurn',config.maxMessagesPerTurn,1,4)}${numberInput('Tentativas antes de encaminhar','maxFieldAttempts',config.maxFieldAttempts,1,5,'Se o campo não for identificado, a triagem pede esclarecimento e depois encaminha.')}${numberInput('Reter conversas e diagnósticos (dias)','retentionDays',config.retentionDays,1,3650,'Mensagens, contatos, filas concluídas e diagnósticos serão excluídos após este prazo.')}${textarea('Termos que indicam urgência (um por linha)','handoffKeywords',newlineList(config.handoffKeywords),'Ao encontrar um termo, a automação pausa e encaminha à equipe.',4)}${textarea('Perguntas jurídicas que devem ir à equipe (uma por linha)','legalQuestionKeywords',newlineList(config.legalQuestionKeywords),'Use expressões para dúvidas individuais sobre direitos, prazos, medidas ou resultados.',4)}${input('Comando para pedir uma pessoa','humanCommand',config.humanCommand,{help:'O contato pode enviar este comando para pausar a automação e solicitar atendimento humano.'})}</div></div>`;
-  const urgent = content.querySelector('[data-path="handoffKeywords"]'); if(urgent){urgent.dataset.listPath='handoffKeywords';urgent.removeAttribute('data-path');}
-  const legal = content.querySelector('[data-path="legalQuestionKeywords"]'); if(legal){legal.dataset.listPath='legalQuestionKeywords';legal.removeAttribute('data-path');}
 }
 
 function renderFlow() {
@@ -160,39 +145,10 @@ function renderMessages() {
 
 function renderKnowledge() {
   const materials=(config.materials||[]).map((material,index)=>`<div class="material-card"><div class="material-head"><div class="control"><label>Título do material</label><input data-path="materials.${index}.title" value="${escapeHtml(material.title)}"></div><button class="button small danger" data-action="remove-material" data-index="${index}">Remover</button></div><div class="control"><label>Conteúdo de apoio</label><textarea rows="5" data-path="materials.${index}.content">${escapeHtml(material.content)}</textarea><small>Use informações aprovadas pelo escritório. Evite dados de clientes e documentos de casos reais.</small></div></div>`).join('');
-  content.innerHTML=heading('ORIENTAÇÕES DO ESCRITÓRIO','Configure a triagem sem gerar aconselhamento.','O modelo local extrai somente os campos configurados. Mensagens ao contato vêm de textos fixos e perguntas aprovadas pelo escritório.')+
+  content.innerHTML=heading('ORIENTAÇÕES DO ESCRITÓRIO','Configure a triagem sem gerar aconselhamento.','A IA só extrai campos com evidência literal na mensagem. Mensagens ao contato vêm de textos fixos e perguntas aprovadas pelo escritório.')+
     `<div class="grid two"><div class="card"><h2>Tom e limites</h2><p class="card-description">As mensagens do bot usam os textos fixos editáveis em “Mensagens”. Esta nota não é enviada ao modelo.</p>${textarea('Nota de redação para a equipe','writingStyle',config.writingStyle,'Orientação para quem revisa os textos fixos.',7)}<div class="rule"></div>${textarea('Temas a encaminhar (um por linha)','forbiddenTopics',newlineList(config.forbiddenTopics),'Se a mensagem corresponder a um destes termos, a automação encaminha à equipe.',5)}</div><div class="card"><h2>Informações do escritório</h2><p class="card-description">Notas de referência para a equipe. O conteúdo não é enviado ao modelo.</p>${textarea('Contexto interno','officeMemory',config.officeMemory||'','Não inclua dados de clientes.',8)}<div class="notice">As respostas ficam no SQLite local para continuidade e encaminhamento; acesso ao painel é protegido por senha.</div></div></div>`+
     `<div class="card section-card"><div class="card-title-row"><div><h2>Materiais internos</h2><p class="card-description" style="margin:5px 0 0">Mantenha referências de apoio para a equipe. O bot não envia esses conteúdos ao modelo.</p></div><button class="button small" data-action="add-material">＋ Adicionar texto</button></div><div class="field-grid"><div class="control full-width"><label for="material-files">Arquivos para importar</label><input id="material-files" type="file" multiple accept=".pdf,.txt,.md,.markdown,.csv,.json,.docx,.zip,application/pdf,application/zip"><small>Formatos: PDF, TXT, MD, CSV, JSON e DOCX. Dentro de ZIP, os mesmos formatos. PDFs digitalizados exigem OCR e não serão lidos. Limite conjunto de 20 materiais e 20.000 caracteres.</small></div><div><button class="button primary" data-action="import-materials">Importar arquivos selecionados</button></div></div><div id="material-import-result"></div>${materials||'<div class="empty-state">Nenhum material adicionado.</div>'}<div class="notice">Não inclua dados pessoais nos materiais internos.</div></div>`;
   const doNotSay=content.querySelector('[data-path="forbiddenTopics"]'); if(doNotSay){doNotSay.dataset.listPath='forbiddenTopics';doNotSay.removeAttribute('data-path');}
-}
-
-function renderPreview() {
-  const profile=config.profiles.find((item)=>item.id===config.defaultProfileId)||config.profiles[0];
-  const firstQuestion=config.areaQuestion||profile.fields[0]?.question||'Qual é o assunto?';
-  const contactHasArea=byId('preview-area')?.checked||false;
-  const usesExternal=config.aiProvider==='gemini'||config.audioTranscriptionProvider==='gemini';
-  const intro=[config.greeting,config.assistantNotice,config.privacyNotice].filter(Boolean).join(' ');
-  const messages=usesExternal?[config.externalProviderNotice]:[intro,contactHasArea?(profile.fields.find((field)=>field.id!==config.areaFieldId)?.question||'Como posso ajudar?'):firstQuestion];
-  const opening=messages.length<=config.maxMessagesPerTurn?messages:[...messages.slice(0,config.maxMessagesPerTurn-1),messages.slice(config.maxMessagesPerTurn-1).join('\n\n')];
-  const bubbles=opening.map((text)=>`<div class="bubble outgoing">${escapeHtml(text)}<span class="bubble-time">agora ✓✓</span></div>`).join('');
-  content.innerHTML=heading('PRÉVIA','Veja como a conversa começa.','Simulação visual local; nenhuma mensagem é enviada pelo WhatsApp e nenhum modelo é chamado.')+
-    `<div class="preview-layout"><div class="card"><h2>Simule a primeira mensagem</h2><p class="card-description">Marque se a mensagem recebida já informa a área. O bot usa textos configurados e não responde dúvidas jurídicas.</p>${usesExternal?'<div class="notice">Como Gemini está ativo, a primeira mensagem apenas informa o uso externo; essa mensagem não é processada pelo modelo.</div>':'<label class="checkboxline"><input id="preview-area" type="checkbox" '+(contactHasArea?'checked':'')+'> A primeira mensagem já informa o assunto</label>'}<div class="rule"></div><div class="field-grid">${numberInput('Máximo de balões por resposta','maxMessagesPerTurn',config.maxMessagesPerTurn,1,4)}${numberInput('Caracteres máximos por balão','maxCharsPerMessage',config.maxCharsPerMessage,80,4000)}</div><div class="notice green">Prévia de configuração. A extração usa apenas os campos deste fluxo; mensagens sem extração segura são esclarecidas ou encaminhadas.</div></div><div class="phone"><div class="phone-top"><div class="phone-avatar">${escapeHtml(config.officeName.slice(0,1).toUpperCase())}</div><div><div class="phone-name">${escapeHtml(config.officeName)}</div><div class="phone-status">triagem inicial</div></div></div><div class="bubble">Olá, gostaria de saber sobre o atendimento.<span class="bubble-time">agora</span></div>${bubbles||'<div class="empty">Ajuste a configuração para ver as mensagens.</div>'}</div></div>`;
-  byId('preview-area').addEventListener('change',renderPreview);
-}
-
-async function renderContacts() {
-  content.innerHTML=heading('OPERAÇÃO','Controle elegibilidade e estado.','Somente um contato elegível em estado BOT pode receber resposta. HUMANO e PAUSADO prevalecem; alterar a lista não inicia conversa.')+
-    `<div class="grid two"><section class="card"><h2>Atribuir contato</h2><p class="card-description">Informe o número com DDI. Em Meta Cloud API, a lista interna deste painel é a fonte de verdade.</p><form id="contact-form" class="field-grid"><div class="control"><label>Telefone com DDI</label><input id="contact-phone" type="tel" placeholder="+55 11 99999-9999" required></div><div class="control"><label>Estado do atendimento</label><select id="contact-assignment"><option value="PAUSADO">Pausado / aguarda elegibilidade</option><option value="BOT">Elegível para triagem (BOT)</option><option value="HUMANO">Atendimento humano</option></select></div><button class="button primary" type="submit">Salvar estado</button></form></section><section class="card"><h2>Importar lista CSV</h2><p class="card-description">Colunas: telefone, atribuicao e nome. Valores: NOVO_LEAD, BOT ou HUMANO. Até 1.000 contatos.</p><div class="control"><label for="contact-file">Escolha o arquivo CSV (ou cole os dados abaixo)</label><input id="contact-file" type="file" accept=".csv,text/csv"></div><textarea id="contact-csv" rows="5" placeholder="telefone,atribuicao,nome&#10;+5511999999999,BOT,Ana Silva"></textarea><button class="button section-card" data-action="import-contacts">Importar contatos</button><div id="import-result"></div></section></div>`+
-    `<section class="card section-card"><div class="card-title-row"><div><h2>Contatos acompanhados</h2><p class="card-description" style="margin:5px 0 0">A lista Atendimento tem prioridade se o contato também estiver em outra lista.</p></div><button class="button small" data-action="refresh-contacts">Atualizar</button></div><div id="contacts-table" class="table-wrap"><div class="empty-state">Carregando contatos...</div></div></section>`;
-  const form=byId('contact-form');
-  form?.addEventListener('submit',async(event)=>{event.preventDefault();const phone=byId('contact-phone').value;const assignment=byId('contact-assignment').value;try{await api('/api/contacts/assignment',{method:'PUT',body:JSON.stringify({phone,assignment})});toast('Atribuição atualizada.');void renderContacts();}catch(error){toast(error.message,true);}});
-  byId('contact-file')?.addEventListener('change',async(event)=>{const file=event.target.files?.[0];if(file)byId('contact-csv').value=await file.text();});
-  try {
-    const contacts=await api('/api/contacts');
-    const table=byId('contacts-table');
-    table.innerHTML=contacts.length?`<table><thead><tr><th>Contato</th><th>Número</th><th>Primeiro contato observado</th><th>Elegibilidade</th><th>Estado</th><th>Última atividade</th></tr></thead><tbody>${contacts.map((contact)=>`<tr><td><strong>${escapeHtml(contact.displayName||'Contato')}</strong><small>${escapeHtml(contact.source)}${contact.manualPause?' · pausa manual':''}${contact.automationBlocked?' · bloqueio automático; reative pelo painel após revisão':''}</small></td><td>${escapeHtml(contact.phone)}</td><td>${contact.firstContactObserved?'Sim':'Ainda não'}</td><td>${escapeHtml(contact.eligibility)}</td><td><select data-contact-assignment data-jid="${escapeHtml(contact.jid)}"><option value="PAUSADO" ${contact.assignment==='PAUSADO'?'selected':''}>PAUSADO</option><option value="BOT" ${contact.assignment==='BOT'?'selected':''}>BOT</option><option value="HUMANO" ${contact.assignment==='HUMANO'?'selected':''}>HUMANO</option></select></td><td>${contact.lastActivityAt?new Date(contact.lastActivityAt).toLocaleString('pt-BR'):'—'}</td></tr>`).join('')}</tbody></table>`:'<div class="empty-state">Ainda não há contatos registrados.</div>';
-    table.querySelectorAll('[data-contact-assignment]').forEach((el)=>el.addEventListener('change',()=>updateContact(el.dataset.jid,el.value)));
-  } catch(error) { byId('contacts-table').innerHTML=`<div class="notice">Não foi possível carregar contatos: ${escapeHtml(error.message)}</div>`; }
 }
 
 async function renderDiagnostics() {
@@ -203,22 +159,6 @@ async function renderDiagnostics() {
     const list=byId('diagnostics-list');
     list.innerHTML=events.length?events.map((event)=>`<article class="timeline-item"><span class="timeline-dot ${event.event.includes('falha')?'bad':event.event==='respondida'?'good':''}"></span><div class="timeline-copy"><strong>${escapeHtml(event.event.replaceAll('-',' '))}</strong><span>${escapeHtml(event.detail||'—')}</span><small>${escapeHtml(event.jid)} · ${new Date(event.createdAt).toLocaleString('pt-BR')}</small></div></article>`).join(''):'<div class="empty-state">Nenhum evento registrado ainda.</div>';
   } catch(error) { byId('diagnostics-list').innerHTML=`<div class="notice">Não foi possível carregar eventos: ${escapeHtml(error.message)}</div>`; }
-}
-
-async function updateContact(jid,assignment) {
-  try { await api('/api/contacts/assignment',{method:'PUT',body:JSON.stringify({jid,assignment})});toast(`Contato atribuído a ${assignment}.`); }
-  catch(error){toast(`A atribuição não foi sincronizada: ${error.message}`,true);void renderContacts();}
-}
-
-async function importContacts() {
-  const csv=byId('contact-csv').value;
-  try {
-    const result=await api('/api/contacts/import',{method:'POST',body:JSON.stringify({csv})});
-    const failed=result.results.filter((row)=>!row.ok);
-    byId('import-result').innerHTML=failed.length?`<div class="error-summary import-errors"><strong>Falhas na importação</strong><ul>${failed.map((row)=>`<li><b>${escapeHtml(row.phone)}</b>: ${escapeHtml(row.error)}</li>`).join('')}</ul></div>`:'<div class="notice green">Todos os contatos foram importados e sincronizados.</div>';
-    toast(`${result.imported} contato(s) importado(s).${failed.length?` ${failed.length} com erro; confira os diagnósticos.`:''}`,failed.length>0);
-    void renderContacts();
-  } catch(error){toast(error.message,true);}
 }
 
 function validateBeforeSave(show=true) {
@@ -266,7 +206,7 @@ function attachErrorLinks(panel) {
     if(parts[0]==='profiles'){page='flow';profileIndex=Number(parts[1])||0;}
     else if(['materials','writingStyle','officeMemory','forbiddenTopics'].includes(parts[0]))page='knowledge';
     else if(['officeName','assistantName','greeting','assistantNotice','privacyNotice','externalProviderNotice','areaQuestion','areaFieldId','acknowledgementMessage','clarificationMessage','aiFallbackMessage','handoffMessage','audioRetryMessage','completionMessage','urgencyMessage'].includes(parts[0]))page='messages';
-    else page='behavior';
+    else page='overview';
     render();
     markInvalid(path);
     const field=content.querySelector(`[data-path="${CSS.escape(path)}"]`)||content.querySelector(`[data-list-path="${CSS.escape(path)}"]`);
@@ -283,7 +223,7 @@ function describePath(path) {
     if(parts[2]==='fields'&&Number.isInteger(Number(parts[3]))){const field=profile?.fields?.[Number(parts[3])];label+=` → ${field?.label||`Pergunta ${Number(parts[3])+1}`}`;parts.splice(0,4);}
     else parts.splice(0,2);
   }
-  const titles={officeName:'Nome do escritório',assistantName:'Nome do assistente',writingStyle:'Estilo de escrita',greeting:'Mensagem de abertura',assistantNotice:'Aviso de assistente virtual',privacyNotice:'Aviso de privacidade',areaQuestion:'Pergunta sobre o assunto',areaFieldId:'Campo do assunto',acknowledgementMessage:'Confirmação fixa',clarificationMessage:'Pedido de esclarecimento',aiFallbackMessage:'Falha ou baixa confiança da IA',handoffMessage:'Mensagem de encaminhamento',audioRetryMessage:'Resposta para áudio',completionMessage:'Mensagem de conclusão',urgencyMessage:'Mensagem de urgência',humanCommand:'Comando para atendimento humano',legalQuestionKeywords:'Perguntas jurídicas a encaminhar',firstMessagePolicy:'Política da primeira mensagem',id:'Identificador',label:'Nome do campo',question:'Pergunta enviada',options:'Opções de resposta',materials:'Materiais de apoio',fields:'Perguntas do fluxo',askWhen:'Condição da pergunta',fieldId:'Pergunta da condição',title:'Título do material',content:'Conteúdo do material',defaultProfileId:'Área padrão'};
+  const titles={officeName:'Nome do escritório',assistantName:'Nome do assistente',writingStyle:'Estilo de escrita',greeting:'Mensagem de abertura',assistantNotice:'Aviso de assistente virtual',privacyNotice:'Aviso de privacidade',areaQuestion:'Pergunta sobre o assunto',areaFieldId:'Campo do assunto',acknowledgementMessage:'Confirmação fixa',clarificationMessage:'Pedido de esclarecimento',aiFallbackMessage:'Falha ou baixa confiança da IA',handoffMessage:'Mensagem de encaminhamento',audioRetryMessage:'Resposta para áudio',completionMessage:'Mensagem de conclusão',urgencyMessage:'Mensagem de urgência',humanCommand:'Comando para atendimento humano',legalQuestionKeywords:'Perguntas jurídicas a encaminhar',id:'Identificador',label:'Nome do campo',question:'Pergunta enviada',options:'Opções de resposta',materials:'Materiais de apoio',fields:'Perguntas do fluxo',askWhen:'Condição da pergunta',fieldId:'Pergunta da condição',title:'Título do material',content:'Conteúdo do material',defaultProfileId:'Área padrão'};
   const last=parts.at(-1)||'';
   return `${label}${label!=='Configuração'?' → ':''}${titles[last]||last.replaceAll(/[A-Z]/g,(letter)=>` ${letter.toLowerCase()}`)}`;
 }
@@ -291,12 +231,9 @@ function describePath(path) {
 function action(name,indexValue) {
   const index=Number(indexValue);
   const profile=config.profiles[profileIndex];
-  if(name==='goto-behavior'){page='behavior';render();return;}
   if(name==='refresh-whatsapp'){void refreshWhatsAppStatus();return;}
   if(name==='restart-whatsapp'){void restartWhatsApp();return;}
-  if(name==='import-contacts'){void importContacts();return;}
   if(name==='import-materials'){void importMaterials();return;}
-  if(name==='refresh-contacts'){void renderContacts();return;}
   if(name==='refresh-diagnostics'){void renderDiagnostics();return;}
   if(name==='add-profile') {const id=`fluxo-${Date.now().toString(36)}`;config.profiles.push({id,label:'Nova área',triggers:[],fields:[{id:config.areaFieldId,label:'Área ou assunto',question:'Em poucas palavras, qual é a área ou o assunto?',type:'open_text',options:[],structure:'',required:true}]});profileIndex=config.profiles.length-1;markDirty();renderFlow();return;}
   if(name==='remove-profile'){if(config.profiles.length<2){toast('Mantenha ao menos uma área de atendimento.');return;}config.profiles.splice(profileIndex,1);profileIndex=0;if(!config.profiles.some((item)=>item.id===config.defaultProfileId))config.defaultProfileId=config.profiles[0].id;markDirty();renderFlow();return;}
@@ -364,3 +301,28 @@ byId('logout').addEventListener('click',async()=>{await api('/api/logout',{metho
 byId('restore').addEventListener('click',async()=>{if(!confirm('Restaurar a última versão salva? As configurações atuais serão guardadas antes da restauração.'))return;try{await api('/api/restore-last',{method:'POST',body:'{}'});config=await api('/api/config');dirty=false;render();toast('Versão anterior restaurada.');}catch(error){toast(error.message,true);}});
 
 (async()=>{try{const session=await api('/api/session');if(session.authenticated)await openApp();}catch{login.classList.remove('hidden');}})();
+
+let demo={started:false,messages:[],fields:{},profileId:null,pendingFieldId:null};
+function renderContacts(){
+  const meta=config.whatsappProvider==='meta';
+  content.innerHTML=heading('OPERAÇÃO','Regras das listas','As listas nativas do WhatsApp determinam quando o bot pode responder.')+
+    `<div class="card"><h2>Fluxo automático</h2><ol><li>Uma mensagem recebida de contato fora de <b>Clientes</b> inicia a triagem.</li><li>O agente adiciona <b>Novo Lead</b> e <b>Bot - atendimento</b>, preservando ambas as listas.</li><li>Enquanto <b>Clientes</b> estiver aplicada, o bot não responde.</li><li>Remover <b>Bot - atendimento</b> interrompe a automação.</li><li>Ao remover <b>Clientes</b>, a próxima mensagem habilita a triagem novamente.</li></ol><div class="notice ${meta?'':'green'}">${meta?'Meta Cloud API não sincroniza as listas nativas usadas por este fluxo. Selecione Baileys ou WAHA.':'Listas nativas ativas no provedor selecionado.'}</div></div>`;
+}
+function renderPreview(){
+  demo={started:false,messages:[],fields:{},profileId:null,pendingFieldId:null};
+  content.innerHTML=heading('SIMULAÇÃO','Teste a conversa por turnos','Esta conversa usa um estado temporário no navegador. Não envia mensagens, altera listas nem chama Gemini/Ollama.')+
+    `<div class="grid two"><section class="card"><h2>Conversa de teste</h2><p class="card-description">Modelo configurado: <b id="demo-model">consultando…</b>. A simulação não chama o modelo. Você preenche os campos respondendo às perguntas.</p><button id="demo-start" class="button primary">Iniciar simulação</button><div id="demo-chat" class="demo-chat" aria-live="polite"></div><form id="demo-form" class="field-grid hidden"><label for="demo-input">Sua resposta</label><textarea id="demo-input" rows="3" maxlength="2000" placeholder="Digite uma resposta de teste"></textarea><button class="button primary" type="submit">Enviar resposta</button></form><div class="button-row demo-controls hidden" id="demo-controls"><button id="demo-audio" class="button small" type="button">${config.audioTranscriptionProvider==='disabled'?'Simular áudio desativado':'Simular falha na transcrição'}</button><button id="demo-failure" class="button small" type="button">Simular falha da IA</button></div><button id="demo-reset" class="button quiet hidden">Recomeçar</button></section><section class="card"><h2>O que esta simulação verifica</h2><ul><li>Mensagens de abertura, perguntas e ordem condicional.</li><li>Conclusão da triagem, pedido de humano e urgência.</li><li>Áudio desativado e mensagem de contingência da IA.</li></ul><div class="notice">Estado descartável no navegador: nenhuma mensagem é enviada, nenhuma lista muda e nenhum dado é gravado no banco.</div></section></div>`;
+  void api('/api/ai/models').then(models=>{const provider=config.aiProvider==='gemini'?'Gemini':'Ollama local';const name=config.aiProvider==='gemini'?models.gemini:models.ollama;const model=byId('demo-model');if(model)model.textContent=`${provider} · ${name} (não chamado)`;}).catch(()=>{const model=byId('demo-model');if(model)model.textContent=`${config.aiProvider==='gemini'?'Gemini externo':'Ollama local'} (não chamado)`;});
+  byId('demo-start').onclick=()=>{demo.started=true;const profile=config.profiles.find(p=>p.id===config.defaultProfileId)||config.profiles[0];demo.profileId=profile.id;const first=profile.fields.find(f=>f.id===config.areaFieldId)||profile.fields.find(f=>f.required)||profile.fields[0];demo.pendingFieldId=first?.id||null;const outputs=[];if(config.aiProvider==='gemini'||config.audioTranscriptionProvider==='gemini')outputs.push(config.externalProviderNotice);outputs.push([config.greeting,config.assistantNotice,config.privacyNotice].filter(Boolean).join(' '),first?.id===config.areaFieldId?config.areaQuestion:(first?.question||''));demo.messages.push({from:'user',text:'Olá, gostaria de saber sobre o atendimento.'},...outputs.map(text=>({from:'bot',text})));drawDemo();};
+  byId('demo-form').onsubmit=(event)=>{event.preventDefault();const input=byId('demo-input');const text=input.value.trim();if(!text)return;demo.messages.push({from:'user',text});input.value='';const normalized=text.toLocaleLowerCase('pt-BR');if(normalized===String(config.humanCommand||'HUMANO').trim().toLocaleLowerCase('pt-BR')){demo.messages.push({from:'bot',text:config.handoffMessage});demo.pendingFieldId=null;}else if((config.handoffKeywords||[]).some(k=>normalized.includes(k.toLocaleLowerCase('pt-BR')))){demo.messages.push({from:'bot',text:config.urgencyMessage});demo.pendingFieldId=null;}else if((config.legalQuestionKeywords||[]).some(k=>normalized.includes(k.toLocaleLowerCase('pt-BR')))||(config.forbiddenTopics||[]).some(k=>normalized.includes(k.toLocaleLowerCase('pt-BR')))){demo.messages.push({from:'bot',text:config.handoffMessage});demo.pendingFieldId=null;}else{if(demo.pendingFieldId)demo.fields[demo.pendingFieldId]=text;const profile=config.profiles.find(p=>p.id===demo.profileId)||config.profiles[0];const next=profile.fields.find(f=>!demo.fields[f.id]&&(!f.askWhen||String(demo.fields[f.askWhen.fieldId]||'').toLocaleLowerCase('pt-BR')===f.askWhen.value.toLocaleLowerCase('pt-BR')));if(next){demo.pendingFieldId=next.id;demo.messages.push({from:'bot',text:config.acknowledgementMessage},{from:'bot',text:next.question});}else{demo.pendingFieldId=null;demo.messages.push({from:'bot',text:config.completionMessage});}}drawDemo();};
+  byId('demo-audio').onclick=()=>{demo.messages.push({from:'user',text:'[áudio recebido]'});demo.messages.push({from:'bot',text:config.audioRetryMessage});drawDemo();};
+  byId('demo-failure').onclick=()=>{demo.messages.push({from:'user',text:'[falha simulada do modelo de extração]'});demo.messages.push({from:'bot',text:config.aiFallbackMessage});demo.pendingFieldId=null;drawDemo();};
+  byId('demo-reset').onclick=()=>renderPreview();
+}
+function drawDemo(){const chat=byId('demo-chat');if(!chat)return;chat.innerHTML=demo.messages.map(m=>`<div class="bubble ${m.from==='user'?'':'outgoing'}">${escapeHtml(m.text)}</div>`).join('');byId('demo-form').classList.toggle('hidden',!demo.started||!demo.pendingFieldId);byId('demo-controls').classList.toggle('hidden',!demo.started||!demo.pendingFieldId);byId('demo-reset').classList.toggle('hidden',!demo.started);byId('demo-start').classList.toggle('hidden',demo.started);chat.scrollTop=chat.scrollHeight;}
+function renderOverview(){
+  const profile=config.profiles.find(item=>item.id===config.defaultProfileId)||config.profiles[0];
+  content.innerHTML=heading('PAINEL','Triagem pelo WhatsApp','As listas nativas controlam quem recebe resposta. Configure as perguntas, mensagens e modelo em um só lugar.')+
+    `<div class="grid three"><div class="card stat-card"><div class="stat-label">FLUXOS</div><div class="stat-value">${config.profiles.length}</div><div class="stat-note">${escapeHtml(profile.label)} como padrão</div></div><div class="card stat-card"><div class="stat-label">PERGUNTAS</div><div class="stat-value">${profile.fields.length}</div><div class="stat-note">Campos da triagem</div></div><div class="card stat-card"><div class="stat-label">LISTA DE BLOQUEIO</div><div class="stat-value">Clientes</div><div class="stat-note">Bot não responde enquanto aplicada</div></div></div>`+
+    `<div class="grid two section-card"><div class="card"><h2>Modelo de extração</h2><p class="card-description">A IA só extrai valores literais presentes nas mensagens recebidas. Respostas ao contato são textos fixos.</p>${select('Provedor de IA','aiProvider',config.aiProvider,[['gemini','Gemini externo'],['ollama','Local (Ollama)']],'Padrão: Gemini 3.5 Flash-Lite (4/4 em conjunto sintético pequeno). Gemini processa mensagens após o aviso externo. Os modelos locais avaliados não passaram.')}${select('Transcrição de áudio','audioTranscriptionProvider',config.audioTranscriptionProvider,[['disabled','Desativada'],['gemini','Gemini externo']],'Desativada por padrão.')}</div><div class="card"><h2>Comece por aqui</h2><p class="card-description">Configure a saudação e as perguntas, simule a conversa e confirme as listas do WhatsApp.</p><div class="button-row"><button class="button primary" data-page="preview">Testar conversa</button><button class="button" data-page="flow">Editar perguntas</button><button class="button" data-page="whatsapp">Conexão WhatsApp</button></div><div class="notice green">Novo contato fora de Clientes: o agente aplica Novo Lead + Bot - atendimento. A etiqueta Clientes sempre bloqueia a triagem.</div></div></div>`;
+}

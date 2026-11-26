@@ -1,5 +1,5 @@
 {
-  "aiProvider": "ollama",
+  "aiProvider": "gemini",
   "audioTranscriptionProvider": "disabled",
   "officeName": "Escritório",
   "assistantName": "Assistente virtual",
@@ -8,7 +8,6 @@
   "forbiddenTopics": [],
   "materials": [],
   "greeting": "Olá! Vou fazer algumas perguntas iniciais para encaminhar seu atendimento.",
-  "firstMessagePolicy": "explicit",
   "assistantNotice": "Sou assistente virtual do escritório e faço somente a triagem inicial. Não sou advogado.",
   "privacyNotice": "Compartilhe apenas o necessário. Não envie documentos nem dados sensíveis nesta primeira conversa.",
   "externalProviderNotice": "Para continuar, o conteúdo que você enviar após este aviso poderá ser enviado ao Google Gemini para processamento da triagem. Se preferir, peça atendimento humano ou não continue.",
@@ -35,7 +34,6 @@
   "maxMessagesSentPerDay": 2000,
   "maxMessagesSentPerMonth": 20000,
   "retentionDays": 90,
-  "newContactsOnly": true,
   "maxFieldAttempts": 2,
   "maxAudioBytes": 25000000,
   "maxHistoryMessages": 16,

@@ -37,7 +37,7 @@ export class OllamaProvider implements IntakeAIProvider {
     if (typeof result.message?.content !== 'string' || !result.message.content.trim()) {
       throw new Error('Ollama não retornou uma extração estruturada utilizável.');
     }
-    return parseExtraction(result.message.content, profile);
+    return parseExtraction(result.message.content, profile, history);
   }
 
   async transcribe(): Promise<string> {
