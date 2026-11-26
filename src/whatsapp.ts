@@ -185,6 +185,12 @@ export async function connectWhatsApp(
       markOnlineOnConnect: false,
       shouldSyncHistoryMessage: () => false,
       browser: ['Windows', 'Chrome', '10.0.0'],
+      // A inicialização do WhatsApp pode demorar durante resync; evite falsos timeouts
+      // que deixam a sessão presa em init queries e force o reconector a assumir.
+      connectTimeoutMs: 60_000,
+      defaultQueryTimeoutMs: 60_000,
+      retryRequestDelayMs: 5_000,
+      keepAliveIntervalMs: 25_000,
     });
     socket = nextSocket;
 

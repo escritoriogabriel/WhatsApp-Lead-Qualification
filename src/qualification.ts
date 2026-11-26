@@ -245,6 +245,11 @@ export class QualificationWorker {
       .join(' ')
       .trim();
 
+    if (await this.runConditionalEvents(job, job.jid, state, incoming, userText, history)) {
+      this.db.markMessagesProcessed(incoming.map((message) => message.id));
+      return;
+    }
+
     if (this.isHumanCommand(userText)) {
       await this.handoff(job, job.jid, state, history, 'Solicitação de atendimento humano');
       this.db.markMessagesProcessed(incoming.map((message) => message.id));
@@ -393,6 +398,41 @@ export class QualificationWorker {
     }
 
     this.db.markMessagesProcessed(incoming.map((message) => message.id));
+  }
+
+  private async runConditionalEvents(
+    job: QueueJob,
+    jid: string,
+    state: ConversationState,
+    incoming: StoredMessage[],
+    userText: string,
+    history: StoredMessage[],
+  ): Promise<boolean> {
+    const events = (this.assistant.conditionalEvents ?? []).filter((event) => {
+      if (!event.enabled) return false;
+      if (event.trigger === 'first_message') return history.filter((message) => message.direction === 'inbound').length <= incoming.length;
+      if (event.trigger === 'audio') return incoming.some((message) => message.kind === 'audio');
+      if (event.trigger === 'keyword') return event.keywords.some((keyword) => normalize(userText).includes(normalize(keyword)));
+      return false;
+    });
+    if (!events.length) return false;
+    const event = events[0]!;
+    const suffix = 'conditional-event-' + event.id;
+    if (event.action === 'send_message') {
+      if (event.message.trim()) await this.deliver(job, jid, [event.message], suffix);
+      this.db.recordDiagnostic(jid, 'evento-condicional', `Evento executado: ${event.name}`);
+      return Boolean(event.message.trim());
+    }
+    if (event.action === 'pause') {
+      if (event.message.trim()) await this.deliver(job, jid, [event.message], suffix);
+      state.paused = true;
+      this.db.saveConversationState(jid, state);
+      await this.setContactLabels(jid, 'HUMANO');
+      this.db.recordDiagnostic(jid, 'evento-condicional', `Automação pausada: ${event.name}`);
+      return true;
+    }
+    await this.handoff(job, jid, state, history, `Evento condicional: ${event.name}`, event.message.trim() || undefined);
+    return true;
   }
 
   private chooseProfile(

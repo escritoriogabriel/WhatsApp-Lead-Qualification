@@ -7,6 +7,16 @@
   "officeMemory": "",
   "forbiddenTopics": [],
   "materials": [],
+  "conversationStyleSamples": [],
+  "conversationInstructions": "Use os exemplos somente para aprender o tom, a forma de acolher e a organização das respostas. Nunca copie dados de clientes.",
+  "responseTemplates": {
+    "greeting": "Olá! Vou fazer algumas perguntas iniciais para encaminhar seu atendimento.",
+    "directQuestion": "Para orientar o encaminhamento, preciso primeiro concluir algumas perguntas objetivas.",
+    "acknowledgement": "Obrigado. Vou seguir com a próxima pergunta.",
+    "humanHandoff": "Vou encaminhar seu atendimento para a equipe do escritório.",
+    "completion": "Obrigado pelas informações. Vou encaminhar o resumo para a equipe do escritório."
+  },
+  "conditionalEvents": [],
   "greeting": "Olá! Vou fazer algumas perguntas iniciais para encaminhar seu atendimento.",
   "assistantNotice": "Sou assistente virtual do escritório e faço somente a triagem inicial. Não sou advogado.",
   "privacyNotice": "Compartilhe apenas o necessário. Não envie documentos nem dados sensíveis nesta primeira conversa.",

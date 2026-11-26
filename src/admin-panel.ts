@@ -195,6 +195,36 @@ export async function startAdminPanel(options: PanelOptions): Promise<() => Prom
           sendJson(response, 200, options.getAiModels?.() ?? { ollama: 'configurado no ambiente', gemini: 'configurado no ambiente' });
           return;
         }
+        if (request.method === 'POST' && url.pathname === '/api/conversations/import') {
+          if (!sameOrigin(request)) {
+            sendJson(response, 403, { error: 'Origem da requisição inválida.' });
+            return;
+          }
+          const uploads = await readUploads(request);
+          const samples = [...options.getConfig().conversationStyleSamples];
+          const results: Array<{ file: string; ok: boolean; detail: string }> = [];
+          let totalCharacters = samples.reduce((sum, item) => sum + item.content.length, 0);
+          for (const upload of uploads) {
+            try {
+              if (upload.tooLarge) throw new Error('Arquivo maior que o limite de 15 MB.');
+              if (!['.txt', '.md', '.markdown'].includes(extname(upload.filename).toLowerCase())) throw new Error('Envie um arquivo TXT ou Markdown exportado da conversa.');
+              const content = new TextDecoder('utf-8').decode(upload.buffer).replaceAll('\u0000', '').trim();
+              if (!content) throw new Error('Nenhum texto legível foi encontrado.');
+              if (content.length > 12_000 || totalCharacters + content.length > 30_000) throw new Error('Os exemplos aceitam até 12.000 caracteres por arquivo e 30.000 no conjunto.');
+              samples.push({ title: basenameSafe(upload.filename).slice(0, 160), content });
+              totalCharacters += content.length;
+              results.push({ file: upload.filename, ok: true, detail: 'Exemplo de estilo importado; nomes e fatos continuam sendo tratados como dados não confiáveis.' });
+            } catch (error) { results.push({ file: upload.filename, ok: false, detail: error instanceof Error ? error.message : 'Falha ao importar exemplo.' }); }
+          }
+          if (samples.length !== options.getConfig().conversationStyleSamples.length) {
+            const candidate = validateAssistantConfig({ ...options.getConfig(), conversationStyleSamples: samples });
+            await saveRevision(options.configPath, revisionsDir);
+            await atomicWrite(options.configPath, JSON.stringify(candidate, null, 2) + '\n');
+            await options.setConfig(candidate);
+          }
+          sendJson(response, 200, { imported: results.filter((item) => item.ok).length, results });
+          return;
+        }
         if (request.method === 'POST' && url.pathname === '/api/materials/import') {
           if (!sameOrigin(request)) {
             sendJson(response, 403, { error: 'Origem da requisição inválida.' });
